@@ -30,7 +30,7 @@ class PageGridFigmaImport extends WireData implements Module {
         return [
             'title'    => 'PageGrid Figma Import',
             'version'  => '0.1.0',
-            'author' => 'Jan Ploch, Claude AI',
+            'author'   => 'Jan Ploch, Claude AI',
             'summary'  => 'Import Figma ZIP exports and build PageGrid pages from the admin.',
             'icon'     => 'exchange',
             'requires' => ['FieldtypePageGrid'],

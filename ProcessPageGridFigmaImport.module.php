@@ -12,7 +12,7 @@ class ProcessPageGridFigmaImport extends Process {
         return [
             'title'       => 'Figma Import',
             'version'     => '0.1.0',
-            'author' => 'Jan Ploch, Claude AI',
+            'author'      => 'Jan Ploch, Claude AI',
             'summary'     => 'Import Figma ZIP exports into PageGrid pages.',
             'icon'        => 'exchange',
             'requires'    => ['PageGridFigmaImport'],
