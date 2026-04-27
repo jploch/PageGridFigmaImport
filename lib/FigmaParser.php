@@ -40,10 +40,18 @@ class FigmaParser {
      */
     private $textStyleMap = [];
 
-    public function __construct(array $data, string $extractDir) {
-        $this->data       = $data;
-        $this->extractDir = rtrim($extractDir, '/') . '/';
-        $this->frameWidth = (float)($data['absoluteBoundingBox']['width'] ?? 1280);
+    /**
+     * When true, skip textStyleMap lookups so CSS props are written directly
+     * onto each block instead of delegated to a global pg-class page.
+     * @var bool
+     */
+    private $skipTextStyles = false;
+
+    public function __construct(array $data, string $extractDir, bool $skipTextStyles = false) {
+        $this->data           = $data;
+        $this->extractDir     = rtrim($extractDir, '/') . '/';
+        $this->frameWidth     = (float)($data['absoluteBoundingBox']['width'] ?? 1280);
+        $this->skipTextStyles = $skipTextStyles;
 
         if(!empty($data['layoutGrids'])) {
             $grid    = $data['layoutGrids'][0];
@@ -112,7 +120,7 @@ class FigmaParser {
 
         if(!empty($this->rotatedNodeNames)) {
             $names      = array_unique($this->rotatedNodeNames);
-            $nameList   = implode(', ', array_map(fn($n) => "\"{$n}\"", $names));
+            $nameList   = implode(', ', array_map(fn($n) => "<strong>{$n}</strong>", $names));
             $warnings[] = "Grid positions may be inaccurate for rotated items: {$nameList}";
         }
 
@@ -819,10 +827,10 @@ class FigmaParser {
         $textAlign   = null;
 
         if($isText) {
-            // Resolve textStyle class if the node references one
+            // Resolve textStyle class if the node references one (and global classes are enabled)
             $textStyleClass = '';
             $textStyleProps = [];
-            if(!empty($node['textStyleId']) && isset($this->textStyleMap[$node['textStyleId']])) {
+            if(!$this->skipTextStyles && !empty($node['textStyleId']) && isset($this->textStyleMap[$node['textStyleId']])) {
                 $ts = $this->textStyleMap[$node['textStyleId']];
                 $textStyleClass = $ts['className'];
                 $textStyleProps = $ts['cssProps'];
@@ -950,11 +958,16 @@ class FigmaParser {
             // Always reset margin-top to suppress browser default stacking
             $segStyles['margin-top'] = '0';
 
-            // Derive explicit margin-bottom from the next newlines token
+            // Derive explicit margin-bottom from the next newlines token.
+            // Use the *following* content segment's line height for the gap, not the
+            // current one — the blank line height is defined by the style of the
+            // paragraph that follows (e.g. body text after a large headline).
             $next = isset($tokens[$i + 1]) ? $tokens[$i + 1] : null;
             if($next && $next['type'] === 'newlines' && $next['count'] >= 2) {
-                $blankLines  = $next['count'] - 1;
-                $lineHeightPx = (float)($seg['lineHeight']['value'] ?? 0);
+                $blankLines   = $next['count'] - 1;
+                $nextContent  = isset($tokens[$i + 2]) ? $tokens[$i + 2] : null;
+                $gapSeg       = ($nextContent && $nextContent['type'] === 'content') ? $nextContent['seg'] : $seg;
+                $lineHeightPx = (float)($gapSeg['lineHeight']['value'] ?? 0);
                 if($lineHeightPx > 0) {
                     $segStyles['margin-bottom'] = round($lineHeightPx * $blankLines) . 'px';
                 }

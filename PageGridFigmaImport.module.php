@@ -58,7 +58,8 @@ class PageGridFigmaImport extends WireData implements Module {
      *   string  pageName     Title for the new page (also used as URL name).
      *   int     parentId     ID of the parent page.
      *   string  templateName Template name (must have a PageGrid field).
-     *   string  stylingMode  'A' = all styles in metadata; 'B' = visual styles as CSS output.
+     *   string  stylingMode      'A' = all styles in metadata; 'B' = visual styles as CSS output.
+     *   bool    skipTextStyles   When true, skip creating/updating global text style classes.
      * }
      * @return array {
      *   int    pageId    ID of the created page (0 on failure).
@@ -88,7 +89,8 @@ class PageGridFigmaImport extends WireData implements Module {
             return $this->fail('data.json is not valid JSON.');
         }
 
-        $parser = new FigmaParser($data, $extractDir);
+        $skipTextStyles = !empty($options['skipTextStyles']);
+        $parser = new FigmaParser($data, $extractDir, $skipTextStyles);
         $parsed = $parser->parse();
 
         // Collect any parser-level warnings (e.g. no layout grid found)
@@ -165,11 +167,22 @@ class PageGridFigmaImport extends WireData implements Module {
         $groupCount = count($parsed['groups']);
 
         // ── 7a. Text styles → global CSS classes ─────────────────────────
-        foreach($parsed['textStyles'] ?? [] as $style) {
-            if($mode === 'A') {
-                $this->createPgClass($style['className'], $style['name'], $style['cssProps']);
-            } else {
-                $cssGen->addBlock($style['className'], $style['cssProps']);
+        $textStylesCreated = [];
+        $textStylesUpdated = [];
+        $textStylesInCss   = 0;
+        if(empty($options['skipTextStyles'])) {
+            foreach($parsed['textStyles'] ?? [] as $style) {
+                if($mode === 'A') {
+                    $status = $this->createPgClass($style['className'], $style['name'], $style['cssProps']);
+                    if($status === 'created') {
+                        $textStylesCreated[] = $style['className'];
+                    } elseif($status === 'updated') {
+                        $textStylesUpdated[] = $style['className'];
+                    }
+                } else {
+                    $cssGen->addBlock($style['className'], $style['cssProps']);
+                    $textStylesInCss++;
+                }
             }
         }
 
@@ -220,10 +233,13 @@ class PageGridFigmaImport extends WireData implements Module {
         $adminUrl = $this->config->urls->admin . 'page/edit/?id=' . $newPage->id;
 
         return [
-            'pageId'    => $newPage->id,
-            'pageUrl'   => $adminUrl,
-            'cssOutput' => $mode === 'B' ? $cssGen->render() : '',
-            'warnings'  => $this->warnings,
+            'pageId'             => $newPage->id,
+            'pageUrl'            => $adminUrl,
+            'cssOutput'          => $mode === 'B' ? $cssGen->render() : '',
+            'warnings'           => $this->warnings,
+            'textStylesCreated'  => $textStylesCreated,
+            'textStylesUpdated'  => $textStylesUpdated,
+            'textStylesInCss'    => $textStylesInCss,
         ];
     }
 
@@ -484,22 +500,23 @@ class PageGridFigmaImport extends WireData implements Module {
     }
 
     /**
-    /**
      * Creates or updates a pg-classes page for a text style.
      * The CSS properties are stored in meta('pg_styles') — same format as pg-main.
      * Existing pages are updated with the latest CSS props from the import.
      */
-    private function createPgClass(string $className, string $styleName, array $cssProps): void {
+    private function createPgClass(string $className, string $styleName, array $cssProps): string {
         $pgClasses = $this->pages->get('name=pg-classes, template=pg_container');
-        if(!$pgClasses->id) return;
+        if(!$pgClasses->id) return 'created';
 
         $pagegrid = $this->modules->get('InputfieldPageGrid');
         $existing = $pgClasses->child("name=$className, include=all");
 
         if($existing->id) {
-            // Update styles on the existing class page
+            // Only write if CSS values actually changed
+            $stored = $existing->meta('pg_styles')['pgitem']['breakpoints']['base']['css'] ?? [];
+            if($cssProps === $stored) return 'unchanged';
             $pagegrid->setStyles($existing, $cssProps, 'base', 'pgitem', ['cssClass' => $className]);
-            return;
+            return 'updated';
         }
 
         $page           = new Page($this->templates->get('pg_container'));
@@ -509,6 +526,7 @@ class PageGridFigmaImport extends WireData implements Module {
         $page->save();
 
         $pagegrid->setStyles($page, $cssProps, 'base', 'pgitem', ['cssClass' => $className]);
+        return 'created';
     }
 
     private function fail(string $message): array {

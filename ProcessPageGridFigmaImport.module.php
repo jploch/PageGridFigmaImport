@@ -32,6 +32,27 @@ class ProcessPageGridFigmaImport extends Process {
     // Main execute — show the form or handle submission
     // ─────────────────────────────────────────────────────────────────────────
 
+    public function ___install(): void {
+        parent::___install();
+        // Place this page immediately after the pagegrid setup page
+        $setup  = $this->pages->get('name=setup, template=admin');
+        $pgPage = $setup->child('name=pagegrid, include=all');
+        $myPage = $setup->child('name=pagegrid-figma-importer, include=all');
+        if(!$pgPage->id || !$myPage->id) return;
+
+        // Re-order in memory then re-save sort values
+        $siblings = $setup->children('include=all, sort=sort');
+        $siblings->insertAfter($myPage, $pgPage);
+        $n = 0;
+        foreach($siblings as $p) {
+            if($p->sort !== $n) {
+                $p->sort = $n;
+                $p->save(['noHooks' => true, 'quiet' => true]);
+            }
+            $n++;
+        }
+    }
+
     public function ___execute(): string {
         $this->headline('Figma to PageGrid Importer');
         $this->browserTitle('Figma to PageGrid Importer');
@@ -59,7 +80,7 @@ class ProcessPageGridFigmaImport extends Process {
         $f = $this->modules->get('InputfieldMarkup');
         $f->attr('name', 'figma_zip_wrapper');
         $f->label       = 'Figma ZIP Export';
-        $f->description = 'Upload the ZIP file exported from the Figma MCP tool (must contain data.json at the root and an assets/ folder).';
+        $f->description = 'Upload the ZIP file exported from Figma using the "Figma to PageGrid Exporter" Plugin.';
         $f->value = '
             <label id="figma-zip-label" style="display:inline-flex;align-items:center;gap:10px;cursor:pointer;padding:8px 16px;background:#f4f4f4;border:1px solid #ccc;border-radius:3px;font-size:14px;" 
                    onmouseover="this.style.background=\'#e8e8e8\'" onmouseout="this.style.background=\'#f4f4f4\'">
@@ -128,7 +149,17 @@ class ProcessPageGridFigmaImport extends Process {
         if(!empty($values['auto_row_mode'])) $f->attr('checked', 'checked');
         $f->label       = 'Auto Row Mode';
         $f->description = 'Removes fixed row positions so blocks flow automatically. Quicker to re-arrange in the editor, but the imported layout may differ slightly from the Figma design.';
-        $f->notes       = 'Row positions can also be set in the visual editor or via CSS after the import.';
+        $f->notes       = 'Row auto positions can also be set in the visual editor or via CSS after the import.';
+        $form->add($f);
+
+        // ── Skip Text Styles ──────────────────────────────────────────────
+        /** @var InputfieldCheckbox $f */
+        $f = $this->modules->get('InputfieldCheckbox');
+        $f->attr('name', 'skip_text_styles');
+        $f->attr('value', 1);
+        if(!empty($values['skip_text_styles'])) $f->attr('checked', 'checked');
+        $f->label       = 'Skip Global Text Style Classes';
+        $f->description = 'Text Styles are reusable Figma typography definitions. By default, they import as shared global CSS classes to prevent duplicate code. Check this to skip global classes.';
         $form->add($f);
 
         // ── Submit ────────────────────────────────────────────────────────
@@ -172,8 +203,9 @@ class ProcessPageGridFigmaImport extends Process {
         $pageName     = $this->sanitizer->text($this->input->post('page_name'));
         $parentId     = (int)$this->input->post('parent_id');
         $templateName = $this->sanitizer->name($this->input->post('template_name'));
-        $stylingMode  = strtoupper($this->sanitizer->name($this->input->post('styling_mode')));
-        $autoRowMode  = (bool)$this->input->post('auto_row_mode');
+        $stylingMode    = strtoupper($this->sanitizer->name($this->input->post('styling_mode')));
+        $autoRowMode    = (bool)$this->input->post('auto_row_mode');
+        $skipTextStyles = (bool)$this->input->post('skip_text_styles');
 
         if(!$pageName)     return $this->renderForm(['Page title is required.']);
         if(!$parentId)     return $this->renderForm(['Please select a parent page.']);
@@ -183,13 +215,14 @@ class ProcessPageGridFigmaImport extends Process {
         // ── Run import ────────────────────────────────────────────────────
         /** @var PageGridFigmaImport $importer */
         $importer = $this->modules->get('PageGridFigmaImport');
-        $result   = $importer->import([
-            'zipPath'      => $zipPath,
-            'pageName'     => $pageName,
-            'parentId'     => $parentId,
-            'templateName' => $templateName,
-            'stylingMode'  => $stylingMode,
-            'autoRowMode'  => $autoRowMode,
+        $result = $importer->import([
+            'zipPath'         => $zipPath,
+            'pageName'        => $pageName,
+            'parentId'        => $parentId,
+            'templateName'    => $templateName,
+            'stylingMode'     => $stylingMode,
+            'autoRowMode'     => $autoRowMode,
+            'skipTextStyles'  => $skipTextStyles,
         ]);
 
         // Clean up uploaded ZIP after extraction
@@ -219,6 +252,26 @@ class ProcessPageGridFigmaImport extends Process {
         // Success banner
         $out .= $this->alertHtml('success', 'Import successful!');
 
+        // Text style class summary (mode A)
+        $styleCreated = $result['textStylesCreated'] ?? [];
+        $styleUpdated = $result['textStylesUpdated'] ?? [];
+        if(!empty($styleCreated)) {
+            $names = implode(', ', array_map(fn($n) => '<strong>' . $n . '</strong>', $styleCreated));
+            $count = count($styleCreated);
+            $out .= $this->alertHtml('success', $count . ' text style ' . ($count === 1 ? 'class' : 'classes') . ' created: ' . $names);
+        }
+        if(!empty($styleUpdated)) {
+            $names = implode(', ', array_map(fn($n) => '<strong>' . $n . '</strong>', $styleUpdated));
+            $count = count($styleUpdated);
+            $out .= $this->alertHtml('success', $count . ' text style ' . ($count === 1 ? 'class' : 'classes') . ' updated: ' . $names);
+        }
+
+        // Text style summary (mode B)
+        $styleInCss = $result['textStylesInCss'] ?? 0;
+        if($styleInCss > 0) {
+            $out .= $this->alertHtml('success', $styleInCss . ' text style ' . ($styleInCss === 1 ? 'class' : 'classes') . ' included in CSS output.');
+        }
+
         // Warnings — UIkit alert banners inside the result HTML
         if(!empty($result['warnings'])) {
             $out .= $this->alertHtml('warning', $result['warnings']);
@@ -226,9 +279,9 @@ class ProcessPageGridFigmaImport extends Process {
 
         // Links
         $out .= '<p>';
-        $out .= '<a class="ui-button" href="' . $this->sanitizer->entities($pageEditUrl) . '">Open in PageGrid</a>';
+        $out .= '<a class="ui-button" href="' . $this->sanitizer->entities($pageEditUrl) . '"><i class="fa fa-edit"></i> Open in PageGrid</a>';
         if($viewUrl) {
-            $out .= ' &nbsp;<a class="ui-button" href="' . $this->sanitizer->entities($viewUrl) . '" target="_blank">View Page</a>';
+            $out .= ' &nbsp;<a class="ui-button" href="' . $this->sanitizer->entities($viewUrl) . '" target="_blank"><i class="fa fa-eye"></i> View Page</a>';
         }
         $out .= '</p>';
 
@@ -254,11 +307,12 @@ class ProcessPageGridFigmaImport extends Process {
 
     private function postedValues(): array {
         return [
-            'page_name'     => $this->sanitizer->text($this->input->post('page_name')),
-            'parent_id'     => (int)$this->input->post('parent_id'),
-            'template_name' => $this->sanitizer->name($this->input->post('template_name')),
-            'styling_mode'  => $this->sanitizer->name($this->input->post('styling_mode')),
-            'auto_row_mode' => (bool)$this->input->post('auto_row_mode'),
+            'page_name'        => $this->sanitizer->text($this->input->post('page_name')),
+            'parent_id'        => (int)$this->input->post('parent_id'),
+            'template_name'    => $this->sanitizer->name($this->input->post('template_name')),
+            'styling_mode'     => $this->sanitizer->name($this->input->post('styling_mode')),
+            'auto_row_mode'    => (bool)$this->input->post('auto_row_mode'),
+            'skip_text_styles' => (bool)$this->input->post('skip_text_styles'),
         ];
     }
 
@@ -268,20 +322,21 @@ class ProcessPageGridFigmaImport extends Process {
      * @param string       $type     'success' | 'warning' | 'danger'
      * @param string|array $messages Single message string or array of messages.
      */
-    private function alertHtml(string $type, $messages): string {
+    private function alertHtml(string $type, $messages, bool $closeable = true): string {
         if(empty($messages)) return '';
         $messages = (array)$messages;
         $icons = [
             'success' => '<i class="fa fa-check-circle"></i> ',
             'warning' => '<i class="fa fa-exclamation-triangle"></i> ',
             'danger'  => '<i class="fa fa-times-circle"></i> ',
+            'primary' => '<i class="fa fa-info-circle"></i> ',
         ];
-        $icon = $icons[$type] ?? '';
+        $icon  = $icons[$type] ?? '';
         $out = '';
         foreach($messages as $msg) {
             $out .= '<div class="uk-alert-' . $type . '" uk-alert>';
-            $out .= '<a href class="uk-alert-close" uk-close></a>';
-            $out .= '<p>' . $icon . $this->sanitizer->entities($msg) . '</p>';
+            if($closeable) $out .= '<a href class="uk-alert-close" uk-close></a>';
+            $out .= '<p>' . $icon . $msg . '</p>';
             $out .= '</div>';
         }
         return $out;
