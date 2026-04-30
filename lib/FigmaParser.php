@@ -272,7 +272,7 @@ class FigmaParser {
 
         foreach($rawChildren as $node) {
             $type = $node['type'] ?? '';
-            if($type === 'GROUP' || $type === 'FRAME') {
+            if($type === 'GROUP' || $type === 'FRAME' || $type === 'COMPONENT' || $type === 'INSTANCE') {
                 $groups[] = $this->parseGroupNode($node);
             } elseif($type !== 'LINE') {
                 // LINE nodes at frame level have no parent for a border — silently drop
@@ -413,9 +413,9 @@ class FigmaParser {
         $hasOwnGrid   = false; // true only when this node defines its own layoutGrids
         if(!empty($node['layoutGrids'])) {
             $childCalc = new FigmaGridCalculator($node['layoutGrids'][0], $w);
-            // FRAME nodes create their own coordinate space → children already use frame-relative x.
-            // GROUP nodes share the root coordinate space → subtract the group's x to normalise.
-            $childXOffset = ($node['type'] ?? '') === 'FRAME' ? 0.0 : $x;
+            // FRAME, COMPONENT, INSTANCE nodes create their own coordinate space → children
+            // already use local x. GROUP nodes share the root coordinate space → subtract group x.
+            $childXOffset = ($node['type'] ?? '') !== 'GROUP' ? 0.0 : $x;
             $hasOwnGrid   = true;
         } elseif($isNested && $this->hasGrid) {
             // Nested group with no own layoutGrids: build a local calc using this group's width
@@ -490,9 +490,9 @@ class FigmaParser {
             if($w < 250) {
                 // Narrow containers (buttons, tags, badges) use block layout.
                 // Padding is derived from content children's offsets inside the group.
-                // FRAME nodes use frame-local coordinates (lx=0, ly=0); GROUP nodes use
-                // the root coordinate space (lx=$x, ly=$y).
-                $isFrameNode = ($node['type'] ?? '') === 'FRAME';
+                // FRAME, COMPONENT, INSTANCE nodes use local coordinates (lx=0, ly=0);
+                // GROUP nodes share the root coordinate space (lx=$x, ly=$y).
+                $isFrameNode = ($node['type'] ?? '') !== 'GROUP';
                 $lx = $isFrameNode ? 0.0 : $x;
                 $ly = $isFrameNode ? 0.0 : $y;
                 $groupLayoutStyles = array_merge(
@@ -510,11 +510,10 @@ class FigmaParser {
                     $groupLayoutStyles['padding-left']  = (int)$offset . 'px';
                     $groupLayoutStyles['padding-right'] = (int)$offset . 'px';
                 }
-                // FRAME nodes export child coordinates relative to the frame's own origin
-                // (frame-local), so we compare against y=0 / bottom=h.
-                // GROUP nodes share the outer-frame coordinate space, so we use the group's
-                // own y and y+h as the reference.
-                $isFrameNode = ($node['type'] ?? '') === 'FRAME';
+                // FRAME, COMPONENT, INSTANCE nodes export child coordinates relative to their
+                // own origin (local), so compare against y=0 / bottom=h.
+                // GROUP nodes share the outer-frame coordinate space; use the group's y and y+h.
+                $isFrameNode = ($node['type'] ?? '') !== 'GROUP';
                 $localY      = $isFrameNode ? 0.0 : $y;
                 $topInset    = $this->computeTopInset($pgChildNodes, $localY);
                 if($topInset !== null) $groupLayoutStyles['padding-top'] = $topInset;
