@@ -1,6 +1,6 @@
 # PageGridFigmaImport
 
-A ProcessWire module that converts Figma design exports into [PageGrid](https://page-grid.com/) layouts.
+A ProcessWire module that converts Figma design exports into responsive [PageGrid](https://page-grid.com/) layouts powered by a clean CSS Grid structure.
 
 ## What it does
 

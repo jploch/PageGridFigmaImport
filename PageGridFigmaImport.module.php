@@ -29,7 +29,7 @@ class PageGridFigmaImport extends WireData implements Module {
     public static function getModuleInfo(): array {
         return [
             'title'    => 'PageGrid Figma Import',
-            'version'  => '0.1.1',
+            'version'  => '0.1.2',
             'author'   => 'Jan Ploch, Claude AI',
             'summary'  => 'Import Figma ZIP exports and build PageGrid pages from the admin.',
             'icon'     => 'exchange',
@@ -139,10 +139,15 @@ class PageGridFigmaImport extends WireData implements Module {
         // ── 6. Frame-level styles on the field container ──────────────────
         // Always set the full CSS grid spec on the wrapper so blocks placed
         // directly in the fc (direct-frame children) are positioned correctly.
+        // $baseGap drives both row-gap on the container and the margin-bottom
+        // subtraction per group: grid mode uses gridGutter so the gap is handled
+        // by CSS; block mode uses 0 (neutralises the PageGrid 30px default).
+        $baseGap = $isBlockMode ? 0 : (int)$parsed['gridGutter'];
         $fcStyles = [
             'display'               => 'grid',
             'grid-template-columns' => 'repeat(' . $parsed['gridCount'] . ', 1fr)',
             'column-gap'            => $parsed['gridGutter'] . 'px',
+            'row-gap'               => $baseGap . 'px',
             'align-items'           => 'start',
         ];
         if($parsed['frameBackground']) {
@@ -152,14 +157,6 @@ class PageGridFigmaImport extends WireData implements Module {
             $fcStyles['padding'] = $parsed['framePadding'] . 'px';
         }
         $pagegrid->setStyles($fc, $fcStyles);
-
-        // Row gap for grid mode — set once on the container
-        if(!$isBlockMode && !empty($parsed['rowGaps'])) {
-            $rowGap = $this->calcRowGap($parsed['rowGaps']);
-            if($rowGap > 0) {
-                $pagegrid->setStyles($fc, ['row-gap' => $rowGap . 'px']);
-            }
-        }
 
         // ── 7. Process groups and text styles ────────────────────────────
         $mode       = $options['stylingMode'] ?? 'A';
@@ -192,6 +189,12 @@ class PageGridFigmaImport extends WireData implements Module {
             // Direct-frame content blocks (TEXT, ELLIPSE, etc. not inside any GROUP):
             // place them straight into the field container without a pg_group wrapper.
             if(!empty($groupData['isDirectBlock'])) {
+                if($i < $groupCount - 1 && isset($parsed['rowGaps'][$i])) {
+                    $mb = max(0, (int)$parsed['rowGaps'][$i] - $baseGap);
+                    if($mb > 0) {
+                        $groupData['blockStyles']['margin-bottom'] = $mb . 'px';
+                    }
+                }
                 $this->createBlock($groupData, $fc, $pagegrid, $mode, $cssGen, $extractDir);
                 continue;
             }
@@ -207,11 +210,12 @@ class PageGridFigmaImport extends WireData implements Module {
                 $pagegrid->setStyles($group, $groupData['groupLayoutStyles']);
             }
 
-            // Row gap in block mode (not last group)
-            if($isBlockMode && $i < $groupCount - 1 && isset($parsed['rowGaps'][$i])) {
-                $gap = (int)$parsed['rowGaps'][$i];
-                if($gap > 0) {
-                    $pagegrid->setStyles($group, ['margin-bottom' => $gap . 'px']);
+            // Margin-bottom to recreate the Figma gap between groups.
+            // Subtract $baseGap so the CSS row-gap (grid mode) or block default isn't doubled.
+            if($i < $groupCount - 1 && isset($parsed['rowGaps'][$i])) {
+                $mb = max(0, (int)$parsed['rowGaps'][$i] - $baseGap);
+                if($mb > 0) {
+                    $pagegrid->setStyles($group, ['margin-bottom' => $mb . 'px']);
                 }
             }
 

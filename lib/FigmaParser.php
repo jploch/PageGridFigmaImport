@@ -817,7 +817,18 @@ class FigmaParser {
 
         // Block-level visual styles — skipped for image blocks (the image asset
         // already embeds all fills, borders and effects from Figma).
-        $blockStyles = $isImage ? [] : $this->extractBlockStyles($node, $isText);
+        // Exception: border-radius cannot be embedded in an image file and must be
+        // applied as CSS on the pgitem wrapper; overflow:hidden clips the image corners.
+        if($isImage) {
+            $blockStyles = [];
+            $br = $this->borderRadius($node);
+            if($br !== null) {
+                $blockStyles['border-radius'] = $br;
+                $blockStyles['overflow'] = 'hidden';
+            }
+        } else {
+            $blockStyles = $this->extractBlockStyles($node, $isText);
+        }
 
         // Inner element styles and HTML content for text nodes
         $innerStyles = [];
