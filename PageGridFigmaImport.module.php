@@ -34,7 +34,7 @@ class PageGridFigmaImport extends WireData implements Module {
             'summary'  => 'Import Figma ZIP exports and build PageGrid pages from the admin.',
             'icon'     => 'exchange',
             'requires' => ['FieldtypePageGrid>=2.2.156', 'PageGridBlocks'],
-            'installs' => ['ProcessPageGridFigmaImport'],
+            'installs' => ['ProcessPageGridFigmaImport', 'FileValidatorZip'],
             'singular' => true,
             'autoload' => false,
         ];
@@ -99,6 +99,24 @@ class PageGridFigmaImport extends WireData implements Module {
         }
 
         // ── 3. Row placement ─────────────────────────────────────────────────
+        // Sort direct blocks by (original row, column) before stripping row-start.
+        // The parser assigns correct grid-row-start values via assignUnifiedRows().
+        // Sorting by that pair before stripping ensures items from the same visual
+        // row (same y-range) are adjacent in DOM order, so CSS Grid auto-placement
+        // puts them together even when earlier items occupy overlapping columns.
+        $rows = [];
+        foreach($parsed['groups'] as $i => $g) {
+            $r = (int)($g['gridStyles']['grid-row-start'] ?? 1);
+            $c = (int)($g['gridStyles']['grid-column-start'] ?? 1);
+            $rows[] = ['idx' => $i, 'row' => $r, 'col' => $c];
+        }
+        usort($rows, fn($a, $b) => $a['row'] <=> $b['row'] ?: $a['col'] <=> $b['col']);
+        $sorted = [];
+        foreach($rows as $r) {
+            $sorted[] = $parsed['groups'][$r['idx']];
+        }
+        $parsed['groups'] = $sorted;
+
         // Top-level items (direct frame children) always use CSS grid auto-placement.
         foreach($parsed['groups'] as &$g) {
             unset($g['gridStyles']['grid-row-start']);
@@ -158,6 +176,40 @@ class PageGridFigmaImport extends WireData implements Module {
         }
         $pagegrid->setStyles($fc, $fcStyles);
 
+        // ── 6b. Detect flush children and apply negative margins ────────────
+        $framePadding = (int)$parsed['framePadding'];
+        $frameWidth   = (float)($data['absoluteBoundingBox']['width'] ?? 1280);
+        $frameHeight  = (float)($data['absoluteBoundingBox']['height'] ?? 0);
+        // Edge detection tolerance: fixed 5px (same as grid calculator's right-boundary anchor)
+        $snapTolerance = 5.0;
+
+        if($framePadding > 0) {
+            foreach($parsed['groups'] as $i => $groupData) {
+                $x = (float)($groupData['x'] ?? 0);
+                $y = (float)($groupData['y'] ?? 0);
+                $w = (float)($groupData['width'] ?? 0);
+                $h = (float)($groupData['height'] ?? 0);
+
+                // Full-bleed items (flush with both left and right) already have
+                // their own horizontal edge-to-edge treatment — skip only the
+                // left/right margins so the full-bleed technique takes precedence.
+                $isFullBleed = (abs($x) < $snapTolerance && abs(($x + $w) - $frameWidth) < $snapTolerance);
+
+                if(!$isFullBleed && abs($x) < $snapTolerance) {
+                    $parsed['groups'][$i]['blockStyles']['margin-left'] = '-' . $framePadding . 'px';
+                }
+                if(abs($y) < $snapTolerance) {
+                    $parsed['groups'][$i]['blockStyles']['margin-top'] = '-' . $framePadding . 'px';
+                }
+                if(!$isFullBleed && abs(($x + $w) - $frameWidth) < $snapTolerance) {
+                    $parsed['groups'][$i]['blockStyles']['margin-right'] = '-' . $framePadding . 'px';
+                }
+                if($frameHeight > 0 && abs(($y + $h) - $frameHeight) < $snapTolerance) {
+                    $parsed['groups'][$i]['blockStyles']['margin-bottom'] = '-' . $framePadding . 'px';
+                }
+            }
+        }
+
         // ── 7. Process groups and text styles ────────────────────────────
         $mode       = $options['stylingMode'] ?? 'A';
         $cssGen     = new FigmaCssGenerator();
@@ -204,6 +256,11 @@ class PageGridFigmaImport extends WireData implements Module {
 
             // Grid position (always in metadata)
             $pagegrid->setStyles($group, $groupData['gridStyles']);
+
+            // Apply block-level visual styles (z-index, margins, etc.)
+            if(!empty($groupData['blockStyles'])) {
+                $pagegrid->setStyles($group, $groupData['blockStyles']);
+            }
 
             // Layout styles: display:grid/block, grid-template-columns, gap — always metadata
             if(!empty($groupData['groupLayoutStyles'])) {
@@ -261,10 +318,14 @@ class PageGridFigmaImport extends WireData implements Module {
     ): void {
         $templateName = $this->resolveTemplate($childData['templateHint']);
 
-        // Skip image/gallery blocks with no valid asset on disk — don't create an empty block.
+        // Skip image/gallery blocks with no valid asset on disk —
+        // unless the block has visual styles to render (e.g. a SOLID-filled RECTANGLE
+        // with background-color, border-radius, etc. applied to the pgitem wrapper).
         if(in_array($templateName, ['pg_image', 'pg_gallery'], true)) {
             $imagePath = $childData['imagePath'] ?? null;
-            if(!$imagePath || !is_file($imagePath)) return;
+            if(!$imagePath || !is_file($imagePath)) {
+                if(empty($childData['blockStyles'])) return;
+            }
         }
 
         $block = $pagegrid->addItem($templateName, $parent);
@@ -289,16 +350,41 @@ class PageGridFigmaImport extends WireData implements Module {
                     $cssGen->addBlock($block->name, $childData['groupStyles']);
                 }
             }
+            if(!empty($childData['blockStyles'])) {
+                $pagegrid->setStyles($block, $childData['blockStyles']);
+            }
             foreach($childData['children'] as $nestedChild) {
                 $this->createBlock($nestedChild, $block, $pagegrid, $mode, $cssGen, $extractDir);
             }
             return;
         }
 
+        if($templateName === 'pg_group' && !empty($childData['groupStyles'])) {
+            if($mode === 'A') {
+                $pagegrid->setStyles($block, $childData['groupStyles']);
+            } else {
+                $cssGen->addBlock($block->name, $childData['groupStyles']);
+            }
+        }
+
         // Collect visual block styles
         $blockVisual = $childData['blockStyles'];
         if($childData['textAlign']) {
             $blockVisual['text-align'] = $childData['textAlign'];
+        }
+        if(!empty($childData['leadingTrim']) && isset($childData['leadingTrim']['type'])
+                && $childData['leadingTrim']['type'] !== 'NONE') {
+            $blockVisual['leading-trim'] = 'cap-height';
+            $blockVisual['text-edge']    = 'cap alphabetic';
+        }
+        if(($childData['listSpacing'] ?? 0) > 0) {
+            $blockVisual['--list-spacing'] = round($childData['listSpacing']) . 'px';
+        }
+        if(!empty($childData['hangingPunctuation'])) {
+            $blockVisual['hanging-punctuation'] = 'allow-end';
+        }
+        if(!empty($childData['hangingList'])) {
+            $blockVisual['hanging-list'] = 'allow-end';
         }
 
         // True for templates whose block wrapper IS the rendered element (no sub-elements).
@@ -355,6 +441,30 @@ class PageGridFigmaImport extends WireData implements Module {
         // Image / gallery blocks
         if(in_array($templateName, ['pg_image', 'pg_gallery']) && $imagePath) {
             if(is_file($imagePath)) {
+                $ext = strtolower(pathinfo($imagePath, PATHINFO_EXTENSION));
+                $allowedExts = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'];
+                if(!in_array($ext, $allowedExts, true)) {
+                    return;
+                }
+
+                $allowedMimes = [
+                    'image/png', 'image/jpeg', 'image/gif',
+                    'image/svg+xml', 'image/webp',
+                ];
+                $mime = mime_content_type($imagePath);
+                if(!in_array($mime, $allowedMimes, true)) {
+                    return;
+                }
+
+                if($ext === 'svg') {
+                    $svg = file_get_contents($imagePath);
+                    $svg = preg_replace('/<script\b[^>]*>.*?<\/script>/is', '', $svg);
+                    $svg = preg_replace('/\bon\w+\s*=\s*"[^"]*"/i', '', $svg);
+                    $svg = preg_replace("/\bon\w+\s*=\s*'[^']*'/i", '', $svg);
+                    $svg = preg_replace('/javascript\s*:/i', '', $svg);
+                    file_put_contents($imagePath, $svg);
+                }
+
                 $block->of(false);
                 $block->{$templateName}->add($imagePath);
                 $block->save();
@@ -491,13 +601,73 @@ class PageGridFigmaImport extends WireData implements Module {
 
         $extractDir = $baseDir . date('YmdHis') . '/';
         mkdir($extractDir, 0755, true);
+        $safeExtractDir = rtrim(realpath($extractDir) ?: $extractDir, '/') . '/';
 
         $zip = new \ZipArchive();
         $res = $zip->open($zipPath);
         if($res !== true) {
             throw new \RuntimeException("Cannot open ZIP file (ZipArchive error {$res}).");
         }
-        $zip->extractTo($extractDir);
+
+        if($this->modules->isInstalled('FileValidatorZip')) {
+            $v = $this->modules->get('FileValidatorZip');
+            $v->maxFiles = 500;
+            $v->maxFileMegabytes = 20;
+            $v->maxTotalMegabytes = 100;
+            $v->maxCompRatio = 100;
+            $v->maxDepth = 8;
+            $v->minFiles = 1;
+            $v->maxErrors = 10;
+            $v->allowEncrypted = false;
+            $v->requireFiles = ['data.json'];
+            $v->fatalFiles = ['!\.(php|phtml|pl|py|sh|exe|bat|cmd|com|dll|so|msi)$!'];
+            $v->setZipArchive($zip);
+            if(!$v->isValid($zipPath)) {
+                $errors = $v->errors();
+                $zip->close();
+                throw new \RuntimeException("Invalid ZIP file: {$errors}");
+            }
+        }
+
+        $numFiles = $zip->numFiles;
+        for($i = 0; $i < $numFiles; $i++) {
+            $entryName = $zip->getNameIndex($i);
+            if($entryName === false || $entryName === '') continue;
+
+            $entryName = str_replace('\\', '/', $entryName);
+            $parts = explode('/', $entryName);
+            $safeParts = [];
+            foreach($parts as $part) {
+                if($part === '' || $part === '.') continue;
+                if($part === '..') {
+                    $zip->close();
+                    throw new \RuntimeException("Path traversal detected in ZIP entry: {$entryName}");
+                }
+                $safeParts[] = str_replace(' ', '_', $part);
+            }
+            $safePath = implode('/', $safeParts);
+            if($safePath === '') continue;
+
+            $dest = $safeExtractDir . $safePath;
+
+            if(substr($entryName, -1) === '/') {
+                @mkdir($dest, 0755, true);
+                continue;
+            }
+
+            $parentDir = dirname($dest);
+            if(!is_dir($parentDir)) @mkdir($parentDir, 0755, true);
+
+            $destReal = realpath($parentDir);
+            $baseReal = realpath($safeExtractDir);
+            if($destReal === false || $baseReal === false
+                || strpos($destReal, $baseReal) !== 0) {
+                $zip->close();
+                throw new \RuntimeException("Path traversal blocked for: {$entryName}");
+            }
+
+            copy("zip://{$zipPath}#{$entryName}", $dest);
+        }
         $zip->close();
 
         return $extractDir;

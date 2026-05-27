@@ -88,7 +88,7 @@ class ProcessPageGridFigmaImport extends Process {
                 <span id="figma-zip-label-text">Choose ZIP file…</span>
                 <input type="file" name="figma_zip" accept=".zip" required
                        style="position:absolute;opacity:0;width:0;height:0;"
-                       onchange="document.getElementById(\'figma-zip-label-text\').textContent = this.files[0] ? this.files[0].name : \'Choose ZIP file…\';">
+                        onchange="var fn=this.files[0]?this.files[0].name.replace(/\.zip$/i,\'\'):\'\';document.getElementById(\'figma-zip-label-text\').textContent=this.files[0]?this.files[0].name:\'Choose ZIP file…\';var pn=document.getElementById(\'figma_page_name\');if(pn)pn.value=fn;">
             </label>';
         $form->add($f);
 
@@ -96,6 +96,7 @@ class ProcessPageGridFigmaImport extends Process {
         /** @var InputfieldText $f */
         $f = $this->modules->get('InputfieldText');
         $f->attr('name', 'page_name');
+        $f->attr('id',   'figma_page_name');
         $f->attr('value', $values['page_name'] ?? '');
         $f->label    = 'Page Title';
         $f->required = true;
@@ -187,6 +188,11 @@ class ProcessPageGridFigmaImport extends Process {
         }
         if($uploadedFile['error'] !== UPLOAD_ERR_OK) {
             return $this->renderForm(['File upload failed (error code ' . $uploadedFile['error'] . ').'], $this->postedValues());
+        }
+
+        $maxBytes = 100 * 1024 * 1024;
+        if($uploadedFile['size'] > $maxBytes) {
+            return $this->renderForm(['File too large. Maximum size is 100 MB.'], $this->postedValues());
         }
 
         $ext = strtolower(pathinfo($uploadedFile['name'], PATHINFO_EXTENSION));

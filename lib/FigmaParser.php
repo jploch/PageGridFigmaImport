@@ -272,7 +272,15 @@ class FigmaParser {
 
         foreach($rawChildren as $node) {
             $type = $node['type'] ?? '';
-            if($type === 'GROUP' || $type === 'FRAME' || $type === 'COMPONENT' || $type === 'INSTANCE') {
+            // Small INSTANCE/COMPONENT nodes that are icon wrappers (single IMAGE child,
+            // no layoutGrids, < 100 px) are treated as leaf image nodes rather than groups.
+            if(($type === 'COMPONENT' || $type === 'INSTANCE') && $this->isSingleImageComponent($node)) {
+                $leafNodes[] = $this->flattenImageComponent($node);
+            // INSTANCE/FRAME/COMPONENT with a direct asset URL (mcp_image_url/mcp_svg_url)
+            // and no children — these are exported image fills on an instance, not group containers.
+            } elseif($this->isDirectAssetNode($node)) {
+                $leafNodes[] = $node;
+            } elseif($type === 'GROUP' || $type === 'FRAME' || $type === 'COMPONENT' || $type === 'INSTANCE') {
                 $groups[] = $this->parseGroupNode($node);
             } elseif($type !== 'LINE') {
                 // LINE nodes at frame level have no parent for a border — silently drop
@@ -406,46 +414,100 @@ class FigmaParser {
         $groupName = $node['name'] ?? '';
         $isPgGroup = ($this->templateHint($groupName, $node['type'] ?? '') === 'pg_group');
 
+        // A group whose left AND right edges both lie within ±30 px of the frame boundaries
+        // is a full-bleed section: its background should fill the viewport edge-to-edge.
+        // The importer gives it negative margins to break out of the frame's content padding,
+        // plus matching inner padding so children remain on the standard column grid.
+        $isFullBleed = !$isNested &&
+                       $this->hasGrid &&
+                       ($x >= -30.0 && $x <= 5.0) &&
+                       (($x + $w) >= $this->frameWidth - 30.0);
+
         // Determine calc for THIS group's children.
         // Sub-frames with their own layoutGrids use those; otherwise inherit the frame calc.
         $childCalc    = $this->hasGrid ? $this->calc : null;
         $childXOffset = 0.0; // x coords of children are frame-relative; sub-frames need an offset
         $hasOwnGrid   = false; // true only when this node defines its own layoutGrids
+        $leftInset    = 0.0;  // detected CSS padding-left for wide groups
+        $rightInset   = 0.0;  // detected CSS padding-right for wide groups
         if(!empty($node['layoutGrids'])) {
             $childCalc = new FigmaGridCalculator($node['layoutGrids'][0], $w);
             // FRAME, COMPONENT, INSTANCE nodes create their own coordinate space → children
             // already use local x. GROUP nodes share the root coordinate space → subtract group x.
             $childXOffset = ($node['type'] ?? '') !== 'GROUP' ? 0.0 : $x;
             $hasOwnGrid   = true;
-        } elseif($isNested && $this->hasGrid) {
-            // Nested group with no own layoutGrids: build a local calc using this group's width
+        } elseif($isFullBleed) {
+            // Full-bleed groups sit at x ≈ 0 in frame space; use the frame calc directly.
+            // Children have frame-relative coordinates, so no offset adjustment is needed.
+            $childCalc    = $this->calc;
+            $childXOffset = 0.0;
+        } elseif($this->hasGrid && ($isNested || $this->calc->colStart($x) > 1 || $this->calc->colSpan($w) < $this->calc->getCount())) {
+            // Group with no own layoutGrids: build a local calc using this group's width
             // so children are positioned relative to the group's own coordinate origin.
+            // Applies to: (a) all nested groups, (b) top-level groups that start at col 2+,
+            // and (c) top-level groups at col 1 that span fewer than N columns — all need
+            // repeat(S, 1fr) tracks so the inner grid matches the frame's track size exactly.
             // Same column count and gutter as the frame; no padding offset (the group has no margins).
-            $localGrid = [
-                'pattern'    => 'COLUMNS',
-                'alignment'  => 'STRETCH',
-                'gutterSize' => $this->calc->getGutterSize(),
-                'offset'     => 0,
-                'count'      => $this->calc->getCount(),
+            $lgGutter = $this->calc->getGutterSize();
+            $lgCount  = $this->calc->colSpan($w); // S = group's span in parent frame (not full N)
+
+            // For wide groups detect horizontal content insets (e.g. card left/right padding).
+            // Uses absolute bounding boxes of raw children, so the same formula works for both
+            // GROUP nodes (absolute coords) and INSTANCE/FRAME nodes (also absolute in export).
+            if($w >= 250) {
+                $insets     = $this->computeContentInsets($node['children'] ?? [], $x, $w, $lgGutter, $lgCount);
+                $leftInset  = $insets['left'];
+                $rightInset = $insets['right'];
+            }
+
+            $contentWidth = $w - $leftInset - $rightInset;
+            $localGrid    = [
+                'pattern'     => 'COLUMNS',
+                'alignment'   => 'STRETCH',
+                'gutterSize'  => $lgGutter,
+                'offset'      => 0,
+                'count'       => $lgCount,
+                'sectionSize' => $this->calc->getSectionSize(), // inherit frame's track size
             ];
-            $childCalc    = new FigmaGridCalculator($localGrid, $w);
-            $childXOffset = $x; // children's x are frame-relative; subtract group x to normalise
+            if($leftInset > 0) {
+                // Override sectionSize so the inner grid reflects the padded content area.
+                $localGrid['sectionSize'] = ($contentWidth - ($lgCount - 1) * $lgGutter) / $lgCount;
+            }
+            $childCalc    = new FigmaGridCalculator($localGrid, $leftInset > 0 ? $contentWidth : $w);
+            // Normalise child x to content-area origin: subtract group x AND left inset.
+            $childXOffset = $x + $leftInset;
         }
 
         // ── Collect visual decorator styles ────────────────────────────────
         $groupVisualStyles = [];
         $pgChildNodes      = [];
 
-        // Pre-count decorator-eligible rectangles. A single rect can be lifted as a visual
-        // decorator (background/border) onto the group. When there are 2+ such rects they
-        // are independent content blocks, so none of them should be treated as a decorator.
+        // Pre-count decorator-eligible rectangles. A single rect that fills the entire
+        // group bounding box (±5px) can be lifted as a visual decorator (background/border)
+        // onto the group. A rect that only covers part of the group (e.g. a partial-height
+        // color block) is content, not a decorator. When there are 2+ decorator rects they
+        // are independent content blocks, so none should be treated as a decorator.
         $decoratorRectCount = 0;
         foreach($node['children'] ?? [] as $child) {
-            $cn = $child['name'] ?? '';
-            $ct = $child['type'] ?? '';
-            if($ct === 'RECTANGLE' && strpos($cn, 'pg_') !== 0 && empty($child['children'])
-                && !(!empty($child['mcp_image_url']) || !empty($child['mcp_svg_url'])
-                    || in_array('IMAGE', array_column($child['fills'] ?? [], 'type'), true))) {
+            $cn  = $child['name'] ?? '';
+            $ct  = $child['type'] ?? '';
+            if($ct !== 'RECTANGLE' || strpos($cn, 'pg_') === 0 || !empty($child['children'])
+                || !empty($child['mcp_image_url']) || !empty($child['mcp_svg_url'])
+                || in_array('IMAGE', array_column($child['fills'] ?? [], 'type'), true)) {
+                continue;
+            }
+            $cbb  = $child['absoluteBoundingBox'] ?? [];
+            $crx  = (float)($cbb['x']      ?? 0);
+            $cry  = (float)($cbb['y']      ?? 0);
+            $crw  = (float)($cbb['width']  ?? 0);
+            $crh  = (float)($cbb['height'] ?? 0);
+            $xyTol = 5.0;
+            $yhTol = 15.0;
+            $isFrameNode = ($node['type'] ?? '') !== 'GROUP';
+            $gx0 = $isFrameNode ? 0.0 : $x;
+            $gy0 = $isFrameNode ? 0.0 : $y;
+            if(abs($crx - $gx0) <= $xyTol && abs($cry - $gy0) <= $yhTol
+                && abs($crw - $w) <= $xyTol && abs($crh - $h) <= $yhTol) {
                 $decoratorRectCount++;
             }
         }
@@ -462,11 +524,15 @@ class FigmaParser {
                 || in_array('IMAGE', array_column($child['fills'] ?? [], 'type'), true);
             $isDecoratorRect = $singleDecoratorRect && !$isPgNamed && empty($child['children']) && $childType === 'RECTANGLE' && !$hasImageFill;
             $isDecoratorLine = !$isPgNamed && $childType === 'LINE';
+            // An empty container (FRAME/GROUP/COMPONENT with no children and no image asset)
+            // never produces a visible block and must not influence clustering or layout decisions.
+            $isEmptyContainer = !$isPgNamed && empty($child['children']) && !$hasImageFill
+                && in_array($childType, ['FRAME', 'GROUP', 'COMPONENT'], true);
 
             if($isDecoratorLine) {
                 $lineStyles        = $this->extractLineBorder($child, $x, $y, $w, $h);
                 $groupVisualStyles = array_merge($groupVisualStyles, $lineStyles);
-            } elseif(!$isDecoratorRect && ($isPgNamed || $childType !== '')) {
+            } elseif(!$isDecoratorRect && !$isEmptyContainer && ($isPgNamed || $childType !== '')) {
                 $pgChildNodes[] = $child;
             } else {
                 $decoratorStyles   = $this->extractDecoratorStyles($child);
@@ -482,14 +548,51 @@ class FigmaParser {
 
         // ── Layout styles (always applied to metadata, not CSS output) ─────
         $groupLayoutStyles = [];
+        $isAutoLayout = false;
+        $layoutMode   = null;
         if($isPgGroup && $childCalc) {
             $gutter        = (float)$childCalc->getGutterSize();
             $offset        = (float)$childCalc->getOffset();
             $unitRowHeight = $this->computeUnitRowHeight($pgChildNodes, $gutter);
 
-            if($w < 250) {
-                // Narrow containers (buttons, tags, badges) use block layout.
-                // Padding is derived from content children's offsets inside the group.
+            $hasHPair   = count($pgChildNodes) >= 2 && $this->hasHorizontalPair($pgChildNodes);
+            $isMixedRow = false;
+
+            // Check for explicit Figma auto-layout
+            $layoutMode   = $node['layoutMode'] ?? null;
+            $isAutoLayout = $layoutMode !== null && $layoutMode !== 'NONE';
+
+            if($isAutoLayout) {
+                $isMixedRow = ($layoutMode === 'HORIZONTAL' && ($node['layoutWrap'] ?? '') === 'WRAP');
+                $groupLayoutStyles = $this->buildAutoLayoutStyles($node, $layoutMode);
+            } elseif($w < 400 && $hasHPair) {
+                // Flex + flex-wrap: groups < 400px wide with any two children sharing
+                // horizontal space. Covers pure single-row layouts (icon+label) as well as
+                // mixed-row cards (image, icon+label, text stacked). Always wraps so items
+                // reflow on mobile. Stacked-only groups (no horizontal pairs) use grid.
+                $isMixedRow = true;
+                $colGap = $this->computeInlineClusterGap($pgChildNodes, $h);
+                $rowGap = $this->computeChildRowGap($pgChildNodes, (int)$colGap);
+                $groupLayoutStyles = [
+                    'display'     => 'flex',
+                    'flex-wrap'   => 'wrap',
+                    'align-items' => 'flex-start',
+                    'column-gap'  => (int)round($colGap) . 'px',
+                    'row-gap'     => $rowGap . 'px',
+                ];
+                if($leftInset > 0) {
+                    $groupLayoutStyles['padding-left'] = (int)round($leftInset) . 'px';
+                    if($rightInset > 0)
+                        $groupLayoutStyles['padding-right'] = (int)round($rightInset) . 'px';
+                }
+                $isFrameNode = ($node['type'] ?? '') !== 'GROUP';
+                $localY      = $isFrameNode ? 0.0 : $y;
+                $topInset    = $this->computeTopInset($pgChildNodes, $localY);
+                if($topInset !== null) $groupLayoutStyles['padding-top'] = $topInset;
+                $bottomInset = $this->computeBottomInset($pgChildNodes, $localY, $h);
+                if($bottomInset !== null) $groupLayoutStyles['padding-bottom'] = $bottomInset;
+            } elseif($w < 250) {
+                // Narrow containers with no horizontal pairs: block layout.
                 // FRAME, COMPONENT, INSTANCE nodes use local coordinates (lx=0, ly=0);
                 // GROUP nodes share the root coordinate space (lx=$x, ly=$y).
                 $isFrameNode = ($node['type'] ?? '') !== 'GROUP';
@@ -500,6 +603,7 @@ class FigmaParser {
                     $this->computeGroupPadding($pgChildNodes, $lx, $ly, $w, $h)
                 );
             } else {
+                // Wide containers (≥ 400px) or narrow-but-no-special-case: grid layout.
                 $groupLayoutStyles = [
                     'display'               => 'grid',
                     'grid-template-columns' => 'repeat(' . $childCalc->getCount() . ', 1fr)',
@@ -509,6 +613,23 @@ class FigmaParser {
                 if($hasOwnGrid && $offset > 0) {
                     $groupLayoutStyles['padding-left']  = (int)$offset . 'px';
                     $groupLayoutStyles['padding-right'] = (int)$offset . 'px';
+                } elseif($isFullBleed) {
+                    // Break out of the frame's content padding so the background fills the full
+                    // viewport, then re-add the same offset as inner padding so children remain
+                    // on the standard column grid.
+                    // Uses the piccalilli "full-bleed" utility:
+                    //   width: 100vw          — overrides global `width: 100%` (grid area = 1320px)
+                    //   margin-left: calc(50% - 50vw) — 50% of grid area minus 50vw = -offset px
+                    // No margin-right needed; width is explicit.
+                    $o = (int)$offset;
+                    $groupLayoutStyles['width']         = '100vw';
+                    $groupLayoutStyles['margin-left']   = 'calc(50% - 50vw)';
+                    $groupLayoutStyles['padding-left']  = "{$o}px";
+                    $groupLayoutStyles['padding-right'] = "{$o}px";
+                } elseif($leftInset > 0) {
+                    $groupLayoutStyles['padding-left'] = (int)round($leftInset) . 'px';
+                    if($rightInset > 0)
+                        $groupLayoutStyles['padding-right'] = (int)round($rightInset) . 'px';
                 }
                 // FRAME, COMPONENT, INSTANCE nodes export child coordinates relative to their
                 // own origin (local), so compare against y=0 / bottom=h.
@@ -521,6 +642,7 @@ class FigmaParser {
                 if($bottomInset !== null) $groupLayoutStyles['padding-bottom'] = $bottomInset;
             }
         } else {
+            $isMixedRow    = false;
             $gutter        = $this->hasGrid ? (float)$this->calc->getGutterSize() : 20.0;
             $unitRowHeight = 0.0;
             if(!$isPgGroup) {
@@ -529,12 +651,12 @@ class FigmaParser {
         }
 
         // ── Parse pg_* children with row-span assignment ───────────────────
-        $pgChildren = $this->parseGroupChildren($pgChildNodes, $childCalc, $childXOffset, $unitRowHeight, $gutter);
+        $pgChildren = $this->parseGroupChildren($pgChildNodes, $childCalc, $childXOffset, $unitRowHeight, $gutter, $isMixedRow, $isFullBleed, $isAutoLayout, $layoutMode);
 
         // For narrow groups (e.g. buttons: background rect + single label), force the one
-        // content child to fill the full group width. Wide groups (≥ 250 px) keep the
-        // child's naturally calculated column position — overriding it would be wrong.
-        if($w < 250 && count($pgChildNodes) === 1 && !empty($pgChildren)) {
+        // content child to fill the full group width. Flex rows, auto-layout frames, and
+        // wide groups keep the child's naturally calculated position.
+        if($w < 250 && !$isMixedRow && !$isAutoLayout && count($pgChildNodes) === 1 && !empty($pgChildren)) {
             $pgChildren[0]['gridStyles']['grid-column-start'] = '1';
             $pgChildren[0]['gridStyles']['grid-column-end']   = '-1';
         }
@@ -542,7 +664,9 @@ class FigmaParser {
         return [
             'id'               => $node['id'] ?? '',
             'name'             => $groupName,
+            'x'                => $x,
             'y'                => $y,
+            'width'            => $w,
             'height'           => $h,
             'gridStyles'       => $gridStyles,
             'groupLayoutStyles' => $groupLayoutStyles,
@@ -562,6 +686,139 @@ class FigmaParser {
             if($h > 0) $heights[] = $h;
         }
         return !empty($heights) ? min($heights) : 0.0;
+    }
+
+    /**
+     * Returns true when a node is a small icon component that should be flattened
+     * to a pg_image block instead of treated as a pg_group container.
+     *
+     * Criteria (all must hold):
+     *   - type is INSTANCE or COMPONENT
+     *   - width AND height < 100 px
+     *   - layoutGrids is empty (no column grid defined)
+     *   - exactly 1 child
+     *   - that child is an image asset (mcp_svg_url, mcp_image_url, or type=IMAGE)
+     */
+    private function isSingleImageComponent(array $node): bool {
+        $type = $node['type'] ?? '';
+        if($type !== 'INSTANCE' && $type !== 'COMPONENT') return false;
+        if(!empty($node['layoutGrids'])) return false;
+        $bb = $node['absoluteBoundingBox'] ?? [];
+        if(($bb['width'] ?? PHP_INT_MAX) >= 100 || ($bb['height'] ?? PHP_INT_MAX) >= 100) return false;
+        $kids = $node['children'] ?? [];
+        if(count($kids) !== 1) return false;
+        $child = $kids[0];
+        return !empty($child['mcp_svg_url']) || !empty($child['mcp_image_url'])
+            || ($child['type'] ?? '') === 'IMAGE';
+    }
+
+    /**
+     * Returns true when a node is an INSTANCE, COMPONENT, or FRAME that has its own
+     * asset URL (mcp_image_url or mcp_svg_url) directly on the node with no children.
+     *
+     * These occur when the Figma exporter captures an image fill on an instance node:
+     * the mcp_*_url ends up on the instance wrapper rather than on a child element.
+     */
+    private function isDirectAssetNode(array $node): bool {
+        $type = $node['type'] ?? '';
+        if(!in_array($type, ['INSTANCE', 'COMPONENT', 'FRAME'], true)) return false;
+        if(!empty($node['children'])) return false;
+        return !empty($node['mcp_svg_url']) || !empty($node['mcp_image_url']);
+    }
+
+    /**
+     * Flattens a single-image component to a synthetic leaf node suitable for
+     * parseChildNode(). The IMAGE child's asset data is preserved; its
+     * absoluteBoundingBox is replaced with the INSTANCE's so that grid placement
+     * uses the INSTANCE's canvas position (child coordinates are LOCAL, not absolute).
+     */
+    private function flattenImageComponent(array $node): array {
+        return array_merge($node['children'][0], ['absoluteBoundingBox' => $node['absoluteBoundingBox']]);
+    }
+
+    /**
+     * Detects horizontal content insets (left/right padding) for wide groups.
+     *
+     * Scans raw children using absoluteBoundingBox — works identically for GROUP
+     * nodes (absolute coords) and INSTANCE/FRAME nodes (also absolute in Figma export).
+     * Full-width children (background rects, dividers) are excluded via |cw − gw| < 5.
+     *
+     * Right padding uses a symmetric mirror of the left inset rather than detecting
+     * the right boundary from child widths, because text nodes in Figma auto-size to
+     * their content and their right edge does not reliably define the design boundary.
+     * Exception: if any non-full-width child is flush to the right edge (rightGap < 5),
+     * the design intentionally has no right padding, so right is set to 0.
+     *
+     * Guards (all must pass — returns ['left'=>0,'right'=>0] if any fails):
+     *   G1  leftInset > 5 px
+     *   G2  symmetric total padding < 40 % of group width
+     *   G3  contentWidth >= (count−1)×gutter + count×5  (grid + gaps must fit)
+     *
+     * @param array $rawChildren  $node['children'] — raw Figma child array
+     * @param float $gx           Group's absolute x position (absoluteBoundingBox.x)
+     * @param float $gw           Group width
+     * @param float $gutter       Column gutter size in px
+     * @param int   $count        Column count
+     * @return array              ['left' => float, 'right' => float]
+     */
+    private function computeContentInsets(array $rawChildren, float $gx, float $gw, float $gutter, int $count): array {
+        $zero = ['left' => 0.0, 'right' => 0.0];
+        if(empty($rawChildren)) return $zero;
+
+        $minLeft         = PHP_FLOAT_MAX;
+        $minRightGap     = PHP_FLOAT_MAX;
+        $hasContent      = false;
+        $hasFullWidthItem = false;
+
+        foreach($rawChildren as $child) {
+            $cb = $child['absoluteBoundingBox'] ?? [];
+            $cx = (float)($cb['x']     ?? 0);
+            $cw = (float)($cb['width'] ?? 0);
+            // Skip full-width children that are real content (images, dividers spanning full width).
+            // Decorator rectangles (SOLID or empty fill, no children, no pg_ name) are ignored
+            // because they are card backgrounds and don't affect the inset calculation.
+            if(abs($cw - $gw) < 5.0) {
+                $isImageFill = false;
+                foreach($child['fills'] ?? [] as $fill) {
+                    if(($fill['type'] ?? '') === 'IMAGE') { $isImageFill = true; break; }
+                }
+                $isDecorator = !$isImageFill
+                    && ($child['type'] ?? '') === 'RECTANGLE'
+                    && empty($child['children'])
+                    && strpos($child['name'] ?? '', 'pg_') !== 0;
+                if($isDecorator) continue; // background rect — safe to ignore
+                $hasFullWidthItem = true;
+                continue;
+            }
+
+            $cxRel       = $cx - $gx;
+            $rightGap    = $gw - ($cxRel + $cw);
+            $minLeft     = min($minLeft, $cxRel);
+            $minRightGap = min($minRightGap, $rightGap);
+            $hasContent  = true;
+        }
+
+        if(!$hasContent) return $zero;
+        // Container padding can't correctly represent both full-width and inset children:
+        // applying padding-left would also shift the full-width items off their left edge.
+        if($hasFullWidthItem && $minLeft > 5.0) return $zero;
+
+        // G1: leftInset must be meaningful
+        if($minLeft <= 5.0) return $zero;
+
+        $leftInset  = $minLeft;
+        // If any child is flush to the right edge the design has no right padding.
+        $rightInset = ($minRightGap < 5.0) ? 0.0 : $leftInset;
+
+        // G2: proportional cap — total padding < 40 % of group width
+        if(($leftInset + $rightInset) >= $gw * 0.4) return $zero;
+
+        // G3: content area must still accommodate the grid (min 5 px per column)
+        $contentWidth    = $gw - $leftInset - $rightInset;
+        $minContentWidth = ($count - 1) * $gutter + $count * 5;
+        if($contentWidth < $minContentWidth) return $zero;
+
+        return ['left' => $leftInset, 'right' => $rightInset];
     }
 
     /**
@@ -639,6 +896,208 @@ class FigmaParser {
     }
 
     /**
+     * Builds CSS flexbox layout styles from explicit Figma auto-layout properties.
+     *
+     * @param array  $node        The Figma node with auto-layout props
+     * @param string $layoutMode  "HORIZONTAL" or "VERTICAL"
+     * @return array              ['display' => 'flex', 'flex-direction' => ..., ...]
+     */
+    private function buildAutoLayoutStyles(array $node, string $layoutMode): array {
+        $styles = ['display' => 'flex'];
+        if($layoutMode === 'VERTICAL') {
+            $styles['flex-direction'] = 'column';
+        }
+
+        $itemSpacing        = (int)($node['itemSpacing']        ?? 0);
+        $counterAxisSpacing = (int)($node['counterAxisSpacing'] ?? 0);
+
+        if($layoutMode === 'HORIZONTAL') {
+            if($itemSpacing > 0 && $counterAxisSpacing > 0) {
+                $styles['gap'] = $counterAxisSpacing . 'px ' . $itemSpacing . 'px';
+            } elseif($itemSpacing > 0) {
+                $styles['gap'] = $itemSpacing . 'px';
+            } elseif($counterAxisSpacing > 0) {
+                $styles['gap'] = $counterAxisSpacing . 'px';
+            } else {
+                $styles['gap'] = '0';
+            }
+        } else {
+            if($itemSpacing > 0 && $counterAxisSpacing > 0) {
+                $styles['gap'] = $itemSpacing . 'px ' . $counterAxisSpacing . 'px';
+            } elseif($itemSpacing > 0) {
+                $styles['gap'] = $itemSpacing . 'px';
+            } elseif($counterAxisSpacing > 0) {
+                $styles['gap'] = $counterAxisSpacing . 'px';
+            } else {
+                $styles['gap'] = '0';
+            }
+        }
+
+        if(($node['layoutWrap'] ?? '') === 'WRAP') {
+            $styles['flex-wrap'] = 'wrap';
+        }
+
+        $primaryAlign = $node['primaryAxisAlignItems'] ?? null;
+        $primaryMap   = ['MIN' => 'flex-start', 'CENTER' => 'center', 'MAX' => 'flex-end', 'SPACE_BETWEEN' => 'space-between'];
+        if($primaryAlign && isset($primaryMap[$primaryAlign])) {
+            $styles['justify-content'] = $primaryMap[$primaryAlign];
+        }
+
+        $counterAlign = $node['counterAxisAlignItems'] ?? null;
+        $counterMap   = ['MIN' => 'flex-start', 'CENTER' => 'center', 'MAX' => 'flex-end', 'BASELINE' => 'baseline'];
+        if($counterAlign && isset($counterMap[$counterAlign])) {
+            $styles['align-items'] = $counterMap[$counterAlign];
+        }
+
+        if(($node['paddingLeft']   ?? 0) > 0) $styles['padding-left']   = (int)$node['paddingLeft']   . 'px';
+        if(($node['paddingRight']  ?? 0) > 0) $styles['padding-right']  = (int)$node['paddingRight']  . 'px';
+        if(($node['paddingTop']    ?? 0) > 0) $styles['padding-top']    = (int)$node['paddingTop']    . 'px';
+        if(($node['paddingBottom'] ?? 0) > 0) $styles['padding-bottom'] = (int)$node['paddingBottom'] . 'px';
+
+        return $styles;
+    }
+
+    /**
+     * Returns true if any two children share vertical space (i.e., are side-by-side).
+     * Uses exact Y-extent overlap — no tolerance heuristic needed.
+     *
+     * @param array $children  Raw Figma child nodes with absoluteBoundingBox
+     * @return bool
+     */
+    private function hasHorizontalPair(array $children): bool {
+        foreach($children as $i => $a) {
+            $ay1 = (float)($a['absoluteBoundingBox']['y']      ?? 0);
+            $ay2 = $ay1 + (float)($a['absoluteBoundingBox']['height'] ?? 0);
+            foreach($children as $j => $b) {
+                if($i >= $j) continue;
+                $by1 = (float)($b['absoluteBoundingBox']['y']      ?? 0);
+                $by2 = $by1 + (float)($b['absoluteBoundingBox']['height'] ?? 0);
+                if($ay1 < $by2 && $by1 < $ay2) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Computes the average gap between adjacent children when sorted by X.
+     * Used to determine the CSS `gap` value for flex-row containers.
+     *
+     * @param array $pgChildNodes  Filtered content children
+     * @return float               Gap in px (≥ 0)
+     */
+    private function computeFlexGap(array $pgChildNodes): float {
+        if(count($pgChildNodes) < 2) return 0.0;
+
+        $items = $pgChildNodes;
+        usort($items, static function($a, $b) {
+            $ax = (float)($a['absoluteBoundingBox']['x'] ?? 0);
+            $bx = (float)($b['absoluteBoundingBox']['x'] ?? 0);
+            return $ax <=> $bx;
+        });
+
+        $gaps = [];
+        for($i = 0; $i < count($items) - 1; $i++) {
+            $rightEdge = (float)($items[$i]['absoluteBoundingBox']['x']     ?? 0)
+                       + (float)($items[$i]['absoluteBoundingBox']['width'] ?? 0);
+            $nextLeft  = (float)($items[$i + 1]['absoluteBoundingBox']['x'] ?? 0);
+            $g = $nextLeft - $rightEdge;
+            if($g > 0) $gaps[] = $g;
+        }
+
+        return !empty($gaps) ? array_sum($gaps) / count($gaps) : 0.0;
+    }
+
+    /**
+     * Groups content children into Y-clusters. Children whose Y-centres are within
+     * max(20px, groupH × 15%) of an existing cluster centre are merged into it.
+     * Returns an array of clusters (each cluster is an array of children), sorted
+     * top-to-bottom by cluster centre.
+     *
+     * 15% keeps same-row items together (centers differ by at most item-height-diff/2
+     * ≈ a few px in practice) while keeping different rows separate even when a tall
+     * item (e.g. 50px description) and the next row are close (19px row gap gives
+     * a center-to-center distance of 50px+19px/2 ≈ 44px > 15% of 190px = 28.5px).
+     *
+     * @param array $pgChildNodes  Filtered content children
+     * @param float $groupH        Group bounding-box height
+     * @return array[]
+     */
+    private function computeYClusters(array $pgChildNodes, float $groupH): array {
+        if(empty($pgChildNodes)) return [];
+
+        $tolerance   = max(20.0, $groupH * 0.15);
+        $clusterData = []; // [['center' => float, 'items' => array], ...]
+
+        foreach($pgChildNodes as $child) {
+            $bb      = $child['absoluteBoundingBox'] ?? [];
+            $cy      = (float)($bb['y']      ?? 0);
+            $ch      = (float)($bb['height'] ?? 0);
+            $yCenter = ($ch > 0) ? ($cy + $ch / 2.0) : $cy;
+
+            $matched = false;
+            foreach($clusterData as &$cluster) {
+                if(abs($yCenter - $cluster['center']) <= $tolerance) {
+                    $cluster['center'] = ($cluster['center'] + $yCenter) / 2.0;
+                    $cluster['items'][] = $child;
+                    $matched = true;
+                    break;
+                }
+            }
+            unset($cluster);
+
+            if(!$matched) {
+                $clusterData[] = ['center' => $yCenter, 'items' => [$child]];
+            }
+        }
+
+        usort($clusterData, static fn($a, $b) => $a['center'] <=> $b['center']);
+        return array_column($clusterData, 'items');
+    }
+
+    /**
+     * Computes the column gap for the first inline Y-cluster (the cluster with 2+ items).
+     * Returns the average X-gap between adjacent children in that cluster.
+     *
+     * @param array $pgChildNodes  Filtered content children
+     * @param float $groupH        Group bounding-box height
+     * @return float               Column gap in px (≥ 0)
+     */
+    private function computeInlineClusterGap(array $pgChildNodes, float $groupH): float {
+        foreach($this->computeYClusters($pgChildNodes, $groupH) as $cluster) {
+            if(count($cluster) >= 2) return $this->computeFlexGap($cluster);
+        }
+        return 0.0;
+    }
+
+    /**
+     * Computes the minimum vertical gap between consecutive children sorted by Y.
+     * Used as the CSS row-gap for flex-wrap containers.
+     *
+     * @param array $pgChildNodes  Filtered content children
+     * @param int   $defaultGap    Fallback when no positive gap is found
+     * @return int                 Row gap in px (≥ 0)
+     */
+    private function computeChildRowGap(array $pgChildNodes, int $defaultGap): int {
+        if(count($pgChildNodes) < 2) return $defaultGap;
+
+        $sorted = $pgChildNodes;
+        usort($sorted, static fn($a, $b) =>
+            (float)($a['absoluteBoundingBox']['y'] ?? 0) <=> (float)($b['absoluteBoundingBox']['y'] ?? 0)
+        );
+
+        $minGap = PHP_INT_MAX;
+        for($i = 0; $i < count($sorted) - 1; $i++) {
+            $bottom = (float)($sorted[$i]['absoluteBoundingBox']['y']      ?? 0)
+                    + (float)($sorted[$i]['absoluteBoundingBox']['height'] ?? 0);
+            $top    = (float)($sorted[$i + 1]['absoluteBoundingBox']['y']  ?? 0);
+            $gap    = $top - $bottom;
+            if($gap >= 0) $minGap = min($minGap, (int)round($gap));
+        }
+
+        return ($minGap === PHP_INT_MAX) ? $defaultGap : max(0, $minGap);
+    }
+
+    /**
      * Builds y-cluster–based row data for an array of raw Figma child nodes.
      *
      * Items whose y-start values lie within $gutter tolerance of each other are
@@ -655,22 +1114,27 @@ class FigmaParser {
 
         $tolerance = max($gutter, 10.0);
 
-        // Build sorted list of representative y-values (cluster centres)
-        $clusters = [];
+        // Build clusters as [min, max] y-ranges rather than averaging scalar centres.
+        // Averaging causes centre-drift: when several items with y values spread across
+        // 30 px merge, the averaged centre can move more than $tolerance away from the
+        // original first member, which then fails the lookup check below.
+        // Using ranges, the original member is always within [min-tol, max+tol].
+        $clusters = []; // each entry: ['min' => float, 'max' => float]
         foreach($childNodes as $node) {
-            $y = (float)($node['absoluteBoundingBox']['y'] ?? 0);
+            $y       = (float)($node['absoluteBoundingBox']['y'] ?? 0);
             $matched = false;
-            foreach($clusters as &$cy) {
-                if(abs($y - $cy) <= $tolerance) {
-                    $cy      = ($cy + $y) / 2.0;
-                    $matched = true;
+            foreach($clusters as &$cl) {
+                if($y >= $cl['min'] - $tolerance && $y <= $cl['max'] + $tolerance) {
+                    $cl['min'] = min($cl['min'], $y);
+                    $cl['max'] = max($cl['max'], $y);
+                    $matched   = true;
                     break;
                 }
             }
-            unset($cy);
-            if(!$matched) $clusters[] = $y;
+            unset($cl);
+            if(!$matched) $clusters[] = ['min' => $y, 'max' => $y];
         }
-        sort($clusters);
+        usort($clusters, static fn($a, $b) => $a['min'] <=> $b['min']);
 
         // Assign row-start (1-based cluster index) and span for each node
         $rowData = [];
@@ -680,16 +1144,16 @@ class FigmaParser {
             $yEnd = $y + $h;
 
             $rowStartIdx = 0;
-            foreach($clusters as $ci => $cy) {
-                if(abs($y - $cy) <= $tolerance) {
+            foreach($clusters as $ci => $cl) {
+                if($y >= $cl['min'] - $tolerance && $y <= $cl['max'] + $tolerance) {
                     $rowStartIdx = $ci;
                     break;
                 }
             }
 
             $lastClusterIdx = $rowStartIdx;
-            foreach($clusters as $ci => $cy) {
-                if($ci > $rowStartIdx && $cy < $yEnd) {
+            foreach($clusters as $ci => $cl) {
+                if($ci > $rowStartIdx && $cl['min'] < $yEnd) {
                     $lastClusterIdx = $ci;
                 }
             }
@@ -716,27 +1180,108 @@ class FigmaParser {
      * @param float                      $xOffset       Subtract from child x before calc (for sub-frames)
      * @param float                      $unitRowHeight Unused — kept for signature compat
      * @param float                      $gutter        Gap size in px (cluster tolerance)
+     * @param bool                       $isMixedRow    Flex-wrap: cluster-aware sizing per child
      */
-    private function parseGroupChildren(array $childNodes, ?FigmaGridCalculator $calc, float $xOffset = 0.0, float $unitRowHeight = 0.0, float $gutter = 20.0): array {
+    private function parseGroupChildren(array $childNodes, ?FigmaGridCalculator $calc, float $xOffset = 0.0, float $unitRowHeight = 0.0, float $gutter = 20.0, bool $isMixedRow = false, bool $isFullBleedParent = false, bool $isAutoLayout = false, ?string $layoutMode = null): array {
         if(empty($childNodes)) return [];
 
-        // Sort globally top-to-bottom, then left-to-right
-        usort($childNodes, static function($a, $b) {
-            $ay = $a['absoluteBoundingBox']['y'] ?? 0;
-            $by = $b['absoluteBoundingBox']['y'] ?? 0;
-            if($ay !== $by) return $ay <=> $by;
-            $ax = $a['absoluteBoundingBox']['x'] ?? 0;
-            $bx = $b['absoluteBoundingBox']['x'] ?? 0;
-            return $ax <=> $bx;
-        });
+        // Stamp each child with its original Figma children-array index.
+        // Figma stacks later children on top of earlier ones. The grid-position
+        // sort below loses that order; we preserve it so we can assign z-index
+        // when two items share overlapping grid ranges.
+        foreach($childNodes as $i => &$cn) {
+            $cn['_origIdx'] = $i;
+        }
+        unset($cn);
+
+        // For flex-wrap groups, sort by visual reading order: items sharing horizontal
+        // space (Y-overlap) go left-to-right by X; different horizontal bands go top-to-bottom.
+        // For grid groups, simple Y-then-X sort is fine (positions are CSS-explicit).
+        if($isMixedRow) {
+            $bands = [];
+            foreach($childNodes as $child) {
+                $cy1 = (float)($child['absoluteBoundingBox']['y']      ?? 0);
+                $cy2 = $cy1 + (float)($child['absoluteBoundingBox']['height'] ?? 0);
+                $placed = false;
+                foreach($bands as &$band) {
+                    foreach($band['items'] as $bi) {
+                        $by1 = (float)($bi['absoluteBoundingBox']['y']      ?? 0);
+                        $by2 = $by1 + (float)($bi['absoluteBoundingBox']['height'] ?? 0);
+                        if($cy1 < $by2 && $by1 < $cy2) {
+                            $band['items'][] = $child;
+                            $band['minY']    = min($band['minY'], $cy1);
+                            $placed = true;
+                            break;
+                        }
+                    }
+                    if($placed) break;
+                }
+                unset($band);
+                if(!$placed) $bands[] = ['minY' => $cy1, 'items' => [$child]];
+            }
+            usort($bands, static fn($a, $b) => $a['minY'] <=> $b['minY']);
+            $childNodes = [];
+            foreach($bands as $band) {
+                $row = $band['items'];
+                usort($row, static fn($a, $b) =>
+                    ($a['absoluteBoundingBox']['x'] ?? 0) <=> ($b['absoluteBoundingBox']['x'] ?? 0)
+                );
+                $childNodes = array_merge($childNodes, $row);
+            }
+        } else {
+            // Sort globally top-to-bottom, then left-to-right
+            usort($childNodes, static function($a, $b) {
+                $ay = $a['absoluteBoundingBox']['y'] ?? 0;
+                $by = $b['absoluteBoundingBox']['y'] ?? 0;
+                if($ay !== $by) return $ay <=> $by;
+                $ax = $a['absoluteBoundingBox']['x'] ?? 0;
+                $bx = $b['absoluteBoundingBox']['x'] ?? 0;
+                return $ax <=> $bx;
+            });
+        }
 
         // Compute row positions via y-position clustering.
         // Items with similar y-start share a CSS grid row; a tall item whose
         // bottom edge crosses subsequent clusters gets grid-row-end: span N.
         $rowData = $this->computeYClusterRowData($childNodes, $gutter);
 
+        // For flex-wrap groups, build a map from each child's "x,y" key to cluster info
+        // so we can assign per-child widths based on whether the child is in an inline
+        // (multi-item) cluster or a block (single-item) cluster.
+        $clusterMap = [];
+        if($isMixedRow) {
+            $minY = PHP_FLOAT_MAX;
+            $maxY = -PHP_FLOAT_MAX;
+            foreach($childNodes as $cn) {
+                $cbb  = $cn['absoluteBoundingBox'] ?? [];
+                $cy   = (float)($cbb['y']      ?? 0);
+                $ch   = (float)($cbb['height'] ?? 0);
+                $minY = min($minY, $cy);
+                $maxY = max($maxY, $cy + $ch);
+            }
+            $computedGroupH = max($maxY - $minY, 1.0);
+            $yClusters = $this->computeYClusters($childNodes, $computedGroupH);
+            foreach($yClusters as $cluster) {
+                $isInline = count($cluster) >= 2;
+                foreach($cluster as $clusterItem) {
+                    $bb  = $clusterItem['absoluteBoundingBox'] ?? [];
+                    $key = ($bb['x'] ?? 0) . ',' . ($bb['y'] ?? 0);
+                    $clusterMap[$key] = ['isInline' => $isInline];
+                }
+            }
+        }
+
         // ── Build result ────────────────────────────────────────────────────
         $result = [];
+        $hasFlexGrowSibling = false;
+        if($isAutoLayout && $layoutMode === 'HORIZONTAL') {
+            foreach($childNodes as $cn) {
+                if(((int)($cn['layoutGrow'] ?? 0) > 0)) {
+                    $hasFlexGrowSibling = true;
+                    break;
+                }
+            }
+        }
         foreach($childNodes as $idx => $child) {
             $childName = $child['name'] ?? '';
             $childType = $child['type'] ?? '';
@@ -751,7 +1296,17 @@ class FigmaParser {
             // gridStyles are computed from the parent calc+xOffset so that column
             // placement is relative to the parent container, not the nested group's
             // own internal calc.
-            if($hint === 'pg_group' && !empty($child['children'])) {
+            // Exception: small INSTANCE/COMPONENT nodes that wrap a single image asset
+            // (icon components like "Edit 7") are flattened directly to pg_image so they
+            // render at their actual pixel size rather than as a group container.
+            // Exception 2: INSTANCE/COMPONENT with a direct asset URL and no children —
+            // these are exported image fills (mcp_image_url/mcp_svg_url on the node itself).
+            if($this->isDirectAssetNode($child)) {
+                $parsed = $this->parseChildNode($child, $calc, $xOffset);
+                $parsed['templateHint'] = 'pg_image';
+            } elseif($hint === 'pg_group' && $this->isSingleImageComponent($child)) {
+                $parsed = $this->parseChildNode($this->flattenImageComponent($child), $calc, $xOffset);
+            } elseif($hint === 'pg_group' && !empty($child['children'])) {
                 $groupData = $this->parseGroupNode($child, true);
                 $bbox      = $child['absoluteBoundingBox'] ?? [];
                 $cx        = (float)($bbox['x'] ?? 0) - $xOffset;
@@ -769,11 +1324,22 @@ class FigmaParser {
                     'plainText'         => null,
                     'imagePath'         => null,
                 ];
+                if($hasFlexGrowSibling && !empty($parsed['groupLayoutStyles'])
+                    && ($parsed['groupLayoutStyles']['display'] ?? '') === 'flex') {
+                    $parsed['groupLayoutStyles']['width'] = 'auto';
+                }
             } else {
                 $parsed = $this->parseChildNode($child, $calc, $xOffset);
+                if($child['type'] === 'RECTANGLE' && empty($child['mcp_svg_url']) && empty($child['mcp_image_url'])) {
+                    $parsed['templateHint'] = 'pg_group';
+                }
+                if(empty($parsed['blockStyles']) && empty($parsed['children'] ?? [])
+                    && empty($parsed['plainText'] ?? '') && $parsed['imagePath'] === null) {
+                    continue;
+                }
             }
 
-            if(isset($rowData[$idx])) {
+            if(!$isMixedRow && isset($rowData[$idx])) {
                 $rs = $rowData[$idx]['start'];
                 $sp = $rowData[$idx]['span'];
                 // Emit explicit row-start so placement is independent of DOM order
@@ -782,6 +1348,80 @@ class FigmaParser {
                     $parsed['gridStyles']['grid-row-end'] = 'span ' . $sp;
                 }
             }
+
+            // Apply flex child sizing for flex-wrap (isMixedRow) containers.
+            if($isMixedRow) {
+                $bb  = $child['absoluteBoundingBox'] ?? [];
+                $tpl = $parsed['templateHint'] ?? '';
+
+                // flex-wrap: use cluster membership to decide per-child sizing.
+                $key  = ($bb['x'] ?? 0) . ',' . ($bb['y'] ?? 0);
+                $info = $clusterMap[$key] ?? ['isInline' => false];
+
+                if(!$info['isInline']) {
+                    // Single-item (block) row — force full width to occupy its own row.
+                    $parsed['gridStyles']['width'] = '100%';
+                } else {
+                    // Inline (multi-item) row — natural content sizing.
+                    if(in_array($tpl, ['pg_image', 'pg_gallery'], true)) {
+                        $imgW = (int)round((float)($bb['width'] ?? 0));
+                        if($imgW > 0) {
+                            $parsed['gridStyles']['width']       = $imgW . 'px';
+                            $parsed['gridStyles']['flex-shrink'] = '0';
+                        }
+                    }
+                    // pg_group / text in inline clusters: keep natural content width.
+                }
+            }
+
+            // Apply auto-layout child properties
+            if($isAutoLayout) {
+                $grow = (int)($child['layoutGrow'] ?? 0);
+                if($grow > 0) {
+                    $parsed['gridStyles']['flex-grow'] = (string)$grow;
+                }
+                $lAlign = $child['layoutAlign'] ?? 'INHERIT';
+                if($lAlign === 'STRETCH') {
+                    if($layoutMode === 'HORIZONTAL') {
+                        $parsed['gridStyles']['align-self'] = 'stretch';
+                    } else {
+                        $parsed['gridStyles']['width'] = '100%';
+                    }
+                }
+            }
+
+            // Full-bleed parent: if this child also spans the full frame width, it must
+            // escape the section's padding just like the section escaped the frame's.
+            // Uses the same piccalilli "full-bleed" utility as the section itself:
+            //   width: 100vw                  — always equals viewport width
+            //   margin-left: calc(50% - 50vw) — self-calculating negative margin
+            if($isFullBleedParent && $this->hasGrid && $this->calc) {
+                $cbb = $child['absoluteBoundingBox'] ?? [];
+                $cx  = (float)($cbb['x']     ?? 0);
+                $cw  = (float)($cbb['width']  ?? 0);
+                if(($cx >= -30.0 && $cx <= 5.0) && (($cx + $cw) >= $this->frameWidth - 30.0)) {
+                    $vwStyles = [
+                        'width'       => '100vw',
+                        'margin-left' => 'calc(50% - 50vw)',
+                    ];
+                    if($parsed['templateHint'] === 'pg_group') {
+                        $parsed['groupLayoutStyles'] = array_merge(
+                            $parsed['groupLayoutStyles'] ?? [],
+                            $vwStyles
+                        );
+                    } else {
+                        $parsed['gridStyles'] = array_merge(
+                            $parsed['gridStyles'] ?? [],
+                            $vwStyles
+                        );
+                    }
+                }
+            }
+
+            // Carry the original Figma children-array index so we can compute
+            // z-index for overlapping items after the grid-position sort.
+            $parsed['_origIdx'] = $child['_origIdx'] ?? $idx;
+
             $result[] = $parsed;
         }
 
@@ -790,14 +1430,41 @@ class FigmaParser {
         // unaffected by DOM order. Sorting here makes screen readers traverse
         // items in the same order a sighted user sees them (row by row, left
         // to right within each row).
-        usort($result, static function($a, $b) {
-            $ar = (int)($a['gridStyles']['grid-row-start']    ?? 1);
-            $br = (int)($b['gridStyles']['grid-row-start']    ?? 1);
-            if($ar !== $br) return $ar <=> $br;
-            $ac = (int)($a['gridStyles']['grid-column-start'] ?? 1);
-            $bc = (int)($b['gridStyles']['grid-column-start'] ?? 1);
-            return $ac <=> $bc;
-        });
+        // Flex-wrap groups already have correct DOM order (top-to-bottom, left-to-right)
+        // and have no grid-row positions to sort by.
+        if(!$isMixedRow) {
+            usort($result, static function($a, $b) {
+                $ar = (int)($a['gridStyles']['grid-row-start']    ?? 1);
+                $br = (int)($b['gridStyles']['grid-row-start']    ?? 1);
+                if($ar !== $br) return $ar <=> $br;
+                $ac = (int)($a['gridStyles']['grid-column-start'] ?? 1);
+                $bc = (int)($b['gridStyles']['grid-column-start'] ?? 1);
+                return $ac <=> $bc;
+            });
+        }
+
+        // ── Z-index for overlapping grid items ───────────────────────────────
+        // When two siblings share both column and row grid ranges, the item
+        // that was later in Figma's original children array should render on top
+        // (Figma stacks by array order). Assign z-index: 1 to the topmost item.
+        $resultCount = count($result);
+        for($zi = 0; $zi < $resultCount; $zi++) {
+            for($zj = $zi + 1; $zj < $resultCount; $zj++) {
+                if($this->gridRangesOverlap($result[$zi], $result[$zj])) {
+                    $topIdx = ($result[$zj]['_origIdx'] ?? $zj) > ($result[$zi]['_origIdx'] ?? $zi)
+                        ? $zj : $zi;
+                    $result[$topIdx]['blockStyles']['z-index'] = '1';
+                    if(($result[$topIdx]['templateHint'] ?? '') === 'pg_group'
+                        && !empty($result[$topIdx]['children'])) {
+                        $this->stripChildZIndex($result[$topIdx]['children']);
+                    }
+                }
+            }
+        }
+
+        // Clean internal _origIdx keys from the result
+        foreach($result as &$r) unset($r['_origIdx']);
+        unset($r);
 
         return $result;
     }
@@ -812,6 +1479,11 @@ class FigmaParser {
         $isText    = ($type === 'TEXT');
 
         $templateHint = $this->templateHint($name, $type);
+        // INSTANCE/COMPONENT/FRAME with a direct asset URL and no children
+        // are exported image fills, not group containers.
+        if($this->isDirectAssetNode($node)) {
+            $templateHint = 'pg_image';
+        }
         $gridStyles   = $calcToUse ? $calcToUse->getGridStyles($x, $w) : $this->fullWidthStyles();
         $isImage      = ($templateHint === 'pg_image');
 
@@ -819,22 +1491,35 @@ class FigmaParser {
         // already embeds all fills, borders and effects from Figma).
         // Exception: border-radius cannot be embedded in an image file and must be
         // applied as CSS on the pgitem wrapper; overflow:hidden clips the image corners.
+        // Exception 2: a RECTANGLE with no exported image asset (SOLID fill only,
+        // no mcp_*_url) has no file to embed fills in — extract the full visual
+        // styles so the block renders with background-color on the pgitem wrapper.
         if($isImage) {
-            $blockStyles = [];
-            $br = $this->borderRadius($node);
-            if($br !== null) {
-                $blockStyles['border-radius'] = $br;
-                $blockStyles['overflow'] = 'hidden';
+            $hasAsset = !empty($node['mcp_image_url']) || !empty($node['mcp_svg_url']);
+            if($type === 'RECTANGLE' && !$hasAsset) {
+                $blockStyles = $this->extractBlockStyles($node, false);
+            } else {
+                $blockStyles = [];
+                $br = $this->borderRadius($node);
+                if($br !== null) {
+                    $blockStyles['border-radius'] = $br;
+                    $blockStyles['overflow'] = 'hidden';
+                }
             }
         } else {
             $blockStyles = $this->extractBlockStyles($node, $isText);
         }
 
         // Inner element styles and HTML content for text nodes
-        $innerStyles = [];
-        $html        = null;
-        $plainText   = null;
-        $textAlign   = null;
+        $innerStyles    = [];
+        $html           = null;
+        $plainText      = null;
+        $textAlign      = null;
+        $leadingTrim    = null;
+        $listSpacing    = 0.0;
+        $hangingPunct   = false;
+        $hangingList    = false;
+        $hyperlink      = null;
 
         if($isText) {
             // Resolve textStyle class if the node references one (and global classes are enabled)
@@ -846,11 +1531,16 @@ class FigmaParser {
                 $textStyleProps = $ts['cssProps'];
             }
 
-            $result      = $this->parseTextNode($node, $textStyleClass);
-            $innerStyles = $result['innerStyles'];
-            $html        = $result['html'];
-            $plainText   = $result['plainText'];
-            $textAlign   = $result['textAlign'];
+            $result         = $this->parseTextNode($node, $textStyleClass);
+            $innerStyles    = $result['innerStyles'];
+            $html           = $result['html'];
+            $plainText      = $result['plainText'];
+            $textAlign      = $result['textAlign'];
+            $leadingTrim    = $result['leadingTrim'];
+            $listSpacing    = $result['listSpacing'];
+            $hangingPunct   = $result['hangingPunctuation'];
+            $hangingList    = $result['hangingList'];
+            $hyperlink      = $result['hyperlink'];
 
             // Strip textStyle-covered props so the class handles them (no duplication)
             if($textStyleClass !== '' && !empty($textStyleProps)) {
@@ -876,10 +1566,17 @@ class FigmaParser {
             'blockStyles'    => $blockStyles,
             'innerStyles'    => $innerStyles,
             'textAlign'      => $textAlign,
+            'leadingTrim'    => $leadingTrim,
+            'listSpacing'    => $listSpacing,
+            'hangingPunctuation' => $hangingPunct,
+            'hangingList'    => $hangingList,
+            'hyperlink'      => $hyperlink,
             'html'           => $html,
             'plainText'      => $plainText,
             'imagePath'      => $imagePath,
             'textStyleClass' => $textStyleClass !== '' ? $textStyleClass : null,
+            'x'              => $x,
+            'width'          => $w,
         ];
     }
 
@@ -891,6 +1588,12 @@ class FigmaParser {
         $segments  = $node['textSegments'] ?? [];
         $style     = $node['style']        ?? [];
         $textAlign = $this->extractTextAlign($style);
+
+        $leadingTrim       = $style['leadingTrim']       ?? null;
+        $listSpacing       = (float)($style['listSpacing']       ?? 0);
+        $hangingPunctuation = !empty($style['hangingPunctuation']);
+        $hangingList       = !empty($style['hangingList']);
+        $hyperlink         = $style['hyperlink']          ?? null;
 
         $html        = '';
         $innerStyles = [];
@@ -914,6 +1617,13 @@ class FigmaParser {
         foreach($segments as $seg) {
             $chars = $seg['characters'] ?? '';
 
+            // Determine list type from segment
+            $listType = null;
+            $lo = $seg['listOptions'] ?? null;
+            if($lo && !empty($lo['type']) && strtoupper($lo['type']) !== 'NONE') {
+                $listType = strtoupper($lo['type']) === 'ORDERED' ? 'ol' : 'ul';
+            }
+
             // Count and strip leading newlines (merge into preceding token)
             $leading = strlen($chars) - strlen(ltrim($chars, "\n"));
             if($leading > 0) {
@@ -931,63 +1641,219 @@ class FigmaParser {
                 continue;
             }
 
-            // Split on internal double-newlines (same-style paragraph breaks)
-            $parts = explode("\n\n", $core);
-            foreach($parts as $i => $part) {
-                if($i > 0) {
-                    // \n\n separator = 2 newlines between adjacent same-style paragraphs
-                    $addNewlines(2);
+            if($listType !== null) {
+                // List segments: split on any \n sequence — each \n is a list-item boundary.
+                $parts = preg_split('/(\n+)/', $core, -1, PREG_SPLIT_DELIM_CAPTURE);
+                if($parts === false) $parts = [$core];
+                for($p = 0; $p < count($parts); $p++) {
+                    $part = $parts[$p];
+                    if($p % 2 === 1) {
+                        // Newline separator between list items
+                        $addNewlines(strlen($part));
+                    } else {
+                        if($part === '') continue;
+                        $partHtml = htmlspecialchars($part, ENT_QUOTES, 'UTF-8');
+                        $tokens[] = [
+                            'type'     => 'content',
+                            'tag'      => $this->segmentToTag($seg),
+                            'text'     => $partHtml,
+                            'seg'      => $seg,
+                            'listType' => $listType,
+                        ];
+                    }
                 }
-                // Replace remaining single \n with <br> (soft line break)
-                $partHtml = str_replace("\n", '<br>', htmlspecialchars($part, ENT_QUOTES, 'UTF-8'));
+            } else {
+                // Non-list: split on double-newlines (paragraph breaks), single \n → <br>
+                $parts = explode("\n\n", $core);
+                foreach($parts as $i => $part) {
+                    if($i > 0) {
+                        $addNewlines(2);
+                    }
+                    $partHtml = str_replace("\n", '<br>', htmlspecialchars($part, ENT_QUOTES, 'UTF-8'));
 
-                $tokens[] = [
-                    'type' => 'content',
-                    'tag'  => $this->segmentToTag($seg),
-                    'text' => $partHtml,
-                    'seg'  => $seg,
-                ];
+                    $tokens[] = [
+                        'type'     => 'content',
+                        'tag'      => $this->segmentToTag($seg),
+                        'text'     => $partHtml,
+                        'seg'      => $seg,
+                        'listType' => null,
+                    ];
+                }
             }
 
             $addNewlines($trailing);
         }
 
         // ── Phase B: render tokens ────────────────────────────────────────────
-        $tagStyles = [];
-        $tokenCount = count($tokens);
+        $tagStyles     = [];
+        $tokenCount    = count($tokens);
+        $listOpen      = null; // null, 'ul', or 'ol'
+        $seenSpanDiffs = [];   // track span diffs to avoid property merging
 
         for($i = 0; $i < $tokenCount; $i++) {
             $tok = $tokens[$i];
             if($tok['type'] !== 'content') continue;
 
-            $tag = $tok['tag'];
-            $seg = $tok['seg'];
+            $tag      = $tok['tag'];
+            $seg      = $tok['seg'];
+            $listType = $tok['listType'] ?? null;
 
-            $segStyles = $this->segmentToStyles($seg);
+            // Collect spans: per-segment text + styles within this merged group.
+            // Adjacent same-tag, same-listType content tokens with no intervening
+            // newlines belong to the same paragraph or list item.
+            $spans    = [];
+            $spans[]  = ['text' => $tok['text'], 'styles' => $this->segmentToStyles($seg)];
+            $spans[0]['styles']['margin-top'] = '0';
 
-            // Always reset margin-top to suppress browser default stacking
-            $segStyles['margin-top'] = '0';
+            while(isset($tokens[$i + 1]) && $tokens[$i + 1]['type'] === 'content'
+                    && $tokens[$i + 1]['tag'] === $tag
+                    && ($tokens[$i + 1]['listType'] ?? null) === $listType
+                    && $this->hyperlinkMatch($tok, $tokens[$i + 1])) {
+                $i++;
+                $sStyles = $this->segmentToStyles($tokens[$i]['seg']);
+                $sStyles['margin-top'] = '0';
+                $spans[] = ['text' => $tokens[$i]['text'], 'styles' => $sStyles];
+            }
 
-            // Derive explicit margin-bottom from the next newlines token.
-            // Use the *following* content segment's line height for the gap, not the
-            // current one — the blank line height is defined by the style of the
-            // paragraph that follows (e.g. body text after a large headline).
-            $next = isset($tokens[$i + 1]) ? $tokens[$i + 1] : null;
-            if($next && $next['type'] === 'newlines' && $next['count'] >= 2) {
-                $blankLines   = $next['count'] - 1;
-                $nextContent  = isset($tokens[$i + 2]) ? $tokens[$i + 2] : null;
-                $gapSeg       = ($nextContent && $nextContent['type'] === 'content') ? $nextContent['seg'] : $seg;
-                $lineHeightPx = (float)($gapSeg['lineHeight']['value'] ?? 0);
-                if($lineHeightPx > 0) {
-                    $segStyles['margin-bottom'] = round($lineHeightPx * $blankLines) . 'px';
+            // Compute base styles by merging all spans (last wins), but exclude
+            // font-weight / font-style / text-decoration so they never bleed
+            // across different <li>/<p>/<h*> elements in the same block.
+            $subOnly    = ['font-weight', 'font-style', 'text-decoration'];
+            $baseStyles = [];
+            foreach($spans as $sp) {
+                foreach($sp['styles'] as $k => $v) {
+                    if(in_array($k, $subOnly, true)) continue;
+                    $baseStyles[$k] = $v;
+                }
+            }
+            // Strip optional props absent from the last span so they don't
+            // leak into parent CSS (e.g. text-transform only on a mid-span).
+            $lastSpan = end($spans);
+            foreach(array_keys($baseStyles) as $k) {
+                if(!isset($lastSpan['styles'][$k])) {
+                    unset($baseStyles[$k]);
                 }
             }
 
-            $classAttr = $textStyleClass !== '' ? ' class="' . htmlspecialchars($textStyleClass, ENT_QUOTES) . '"' : '';
-            $html .= '<' . $tag . $classAttr . '>' . $tok['text'] . '</' . $tag . '>';
+            // Derive explicit margin-bottom from the next newlines token.
+            $next = isset($tokens[$i + 1]) ? $tokens[$i + 1] : null;
+            if($next && $next['type'] === 'newlines' && $next['count'] >= 2) {
+                $blankLines  = $next['count'] - 1;
+                $nextContent = isset($tokens[$i + 2]) ? $tokens[$i + 2] : null;
+                $gapSeg      = ($nextContent && $nextContent['type'] === 'content') ? $nextContent['seg'] : $seg;
+                $lhData      = $gapSeg['lineHeight'] ?? [];
+                $lhValue     = (float)($lhData['value'] ?? 0);
+                if($lhValue > 0) {
+                    if(($lhData['unit'] ?? '') === 'PERCENT') {
+                        $lineHeightPx = (float)($gapSeg['fontSize'] ?? 16) * ($lhValue / 100);
+                    } else {
+                        $lineHeightPx = $lhValue;
+                    }
+                    $baseStyles['margin-bottom'] = round($lineHeightPx * $blankLines) . 'px';
+                }
+            }
 
-            // Merge styles per tag (last occurrence wins for same-tag duplicates)
-            $tagStyles[$tag] = array_merge($tagStyles[$tag] ?? [], $segStyles);
+            // Open / close list wrapper when transitioning between list and non-list
+            // or between different list types.
+            if($listType !== $listOpen) {
+                if($listOpen !== null) {
+                    $html     .= '</' . $listOpen . '>';
+                    $listOpen = null;
+                }
+                if($listType !== null) {
+                    $html     .= '<' . $listType . '>';
+                    $listOpen = $listType;
+                }
+            }
+
+            $hl    = $tok['seg']['hyperlink'] ?? null;
+            $hasHl = $hl && isset($hl['type']) && $hl['type'] === 'URL' && !empty($hl['value']);
+
+            if($listType) {
+                $html .= '<li>';
+            } else {
+                $classAttr = $textStyleClass !== '' ? ' class="' . htmlspecialchars($textStyleClass, ENT_QUOTES) . '"' : '';
+                $html     .= '<' . $tag . $classAttr . '>';
+            }
+
+            if($hasHl) {
+                $href  = htmlspecialchars($hl['value'], ENT_QUOTES);
+                $html .= '<a href="' . $href . '" rel="noopener">';
+            }
+
+            // Render each span. When a span's styles differ from base, wrap it in
+            // <strong>, <em>, <u>, <s>, or <span> using single-level innerStyles
+            // keys. At most one unique <span> diff is allowed per block to
+            // avoid property merging across different parent contexts.
+            // Hyperlinked spans: emit bare (already inside <a>), diff against the
+            // stored parent base and accumulate into the 'a' selector.
+            foreach($spans as $sp) {
+                $diff = $this->computeSpanDiff($sp['styles'], $baseStyles);
+                if($diff === null) {
+                    $html .= $sp['text'];
+                } elseif(trim($sp['text']) === '') {
+                    $html .= $sp['text'];
+                } elseif($hasHl) {
+                    $pBase  = $tagStyles[$tag] ?? [];
+                    $hlDiff = $this->computeSpanDiff($sp['styles'], $pBase);
+                    if($hlDiff !== null) {
+                        $tagStyles['a'] = array_merge($tagStyles['a'] ?? [], $hlDiff);
+                    }
+                    $html .= $sp['text'];
+                } else {
+                    $wrapper = $this->spanWrapper($diff);
+                    if($wrapper === 'span') {
+                        $diffKey = json_encode($diff);
+                        if(!empty($seenSpanDiffs) && !isset($seenSpanDiffs[$diffKey])) {
+                            $html .= $sp['text'];
+                            continue;
+                        }
+                        if(!isset($seenSpanDiffs[$diffKey])) {
+                            $seenSpanDiffs[$diffKey] = true;
+                            $tagStyles[$wrapper] = array_merge($tagStyles[$wrapper] ?? [], $diff);
+                        }
+                    } elseif($wrapper === 'u' || $wrapper === 's') {
+                        $cleanDiff = $diff;
+                        $hasExtraDeco = isset($diff['text-decoration-style'])
+                                     || isset($diff['text-underline-offset'])
+                                     || isset($diff['text-decoration-color'])
+                                     || isset($diff['text-decoration-thickness']);
+                        if(!$hasExtraDeco) {
+                            unset($cleanDiff['text-decoration']);
+                        }
+                        if(!empty($cleanDiff)) {
+                            $tagStyles[$wrapper] = array_merge($tagStyles[$wrapper] ?? [], $cleanDiff);
+                        }
+                    } else {
+                        $tagStyles[$wrapper] = array_merge($tagStyles[$wrapper] ?? [], $diff);
+                    }
+                    $html .= '<' . $wrapper . '>' . $sp['text'] . '</' . $wrapper . '>';
+                }
+            }
+
+            if($hasHl) {
+                $html .= '</a>';
+            }
+
+            if($listType) {
+                $html .= '</li>';
+            } else {
+                $html .= '</' . $tag . '>';
+            }
+
+            // Merge base styles into the parent tag (list wrapper gets container props)
+            if($listType) {
+                $wrapperStyles = $this->listWrapperStyles($seg);
+                $tagStyles[$listType] = array_merge($tagStyles[$listType] ?? [], $wrapperStyles);
+                $tagStyles['li']      = array_merge($tagStyles['li']      ?? [], $baseStyles);
+            } elseif(!$hasHl) {
+                $tagStyles[$tag] = array_merge($tagStyles[$tag] ?? [], $baseStyles);
+            }
+        }
+
+        // Close any still-open list wrapper
+        if($listOpen !== null) {
+            $html .= '</' . $listOpen . '>';
         }
 
         foreach($tagStyles as $tag => $props) {
@@ -1003,13 +1869,102 @@ class FigmaParser {
         // Plain text for pg_text field: soft breaks → \n, block boundaries → \n\n (empty line)
         $withBreaks = str_replace(['<br>', '<br/>', '<br />'], "\n", $html);
         $withBreaks = str_replace(
-            ['</h1>', '</h2>', '</h3>', '</h4>', '</h5>', '</h6>', '</p>'],
+            ['</h1>', '</h2>', '</h3>', '</h4>', '</h5>', '</h6>', '</p>', '</li>'],
             "\n\n",
             $withBreaks
         );
         $plainText = trim(preg_replace('/\n{3,}/', "\n\n", strip_tags($withBreaks)));
 
-        return compact('innerStyles', 'html', 'plainText', 'textAlign');
+        return compact('innerStyles', 'html', 'plainText', 'textAlign', 'leadingTrim', 'listSpacing', 'hangingPunctuation', 'hangingList', 'hyperlink');
+    }
+
+    /**
+     * Returns true if two tokens both have no hyperlink, or both have
+     * the same hyperlink — allowing adjacent same-style segments to merge.
+     */
+    private function hyperlinkMatch(array $a, array $b): bool {
+        $ha = $a['seg']['hyperlink'] ?? null;
+        $hb = $b['seg']['hyperlink'] ?? null;
+        if($ha === null && $hb === null) return true;
+        if($ha === null || $hb === null) return false;
+        return ($ha['type'] ?? '') === ($hb['type'] ?? '')
+            && ($ha['value'] ?? '') === ($hb['value'] ?? '');
+    }
+
+    /**
+     * Returns CSS styles for the <ul> or <ol> wrapper element.
+     * Extracts list-style-type, list-style-position, and padding-left
+     * (from indentation level) from a list segment.
+     */
+    private function listWrapperStyles(array $seg): array {
+        $styles = ['margin-top' => '0', 'margin-bottom' => '0'];
+        $lo = $seg['listOptions'] ?? null;
+        if($lo && !empty($lo['type']) && strtoupper($lo['type']) !== 'NONE') {
+            $styles['list-style-type']     = strtoupper($lo['type']) === 'ORDERED' ? 'decimal' : 'disc';
+            $styles['list-style-position'] = 'outside';
+        }
+        $indent = (float)($seg['indentation'] ?? 0);
+        if($indent > 0) $styles['padding-left'] = round($indent * 20) . 'px';
+        return $styles;
+    }
+
+    /**
+     * Returns the HTML element to wrap a style-diff span.
+     * - <strong> when the primary diff is font-weight: 700
+     * - <em>     when the primary diff is font-style: italic
+     * - <u>      for text-decoration:underline
+     * - <s>      for text-decoration:line-through
+     * - <span>   for all other diffs
+     *
+     * font-family is allowed as a secondary diff on any semantic element.
+     */
+    private function spanWrapper(array $diff): string {
+        $primary = $diff;
+        unset($primary['font-family']);
+        if(count($primary) === 1) {
+            if(isset($primary['font-weight'])     && $primary['font-weight']     === '700')   return 'strong';
+            if(isset($primary['font-style'])      && $primary['font-style']      === 'italic') return 'em';
+            if(isset($primary['text-decoration']) && $primary['text-decoration'] === 'underline') return 'u';
+            if(isset($primary['text-decoration']) && $primary['text-decoration'] === 'line-through') return 's';
+        }
+        return 'span';
+    }
+
+    /**
+     * Returns the style properties that differ between a span and the parent's
+     * base styles. Also handles inverse diffs: when the parent has a prop that
+     * the span lacks, the span needs an explicit default (e.g. parent has
+     * font-weight:700, span is Regular → diff adds font-weight:400).
+     *
+     * Returns null when there are no meaningful differences.
+     */
+    private function computeSpanDiff(array $spanStyles, array $baseStyles): ?array {
+        $diff = [];
+        $skip = ['list-style-type', 'list-style-position'];
+
+        foreach($spanStyles as $k => $v) {
+            if(in_array($k, $skip, true)) continue;
+            if(!isset($baseStyles[$k]) || $baseStyles[$k] !== $v) {
+                $diff[$k] = $v;
+            }
+        }
+        foreach($baseStyles as $k => $v) {
+            if(in_array($k, $skip, true)) continue;
+            if(isset($spanStyles[$k])) continue;
+            $default = match($k) {
+                'font-weight'     => '400',
+                'font-style'      => 'normal',
+                'text-decoration' => 'none',
+                default           => null,
+            };
+            if($default !== null) {
+                $diff[$k] = $default;
+            }
+        }
+
+        unset($diff['margin-top']);
+
+        return !empty($diff) ? $diff : null;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1243,13 +2198,70 @@ class FigmaParser {
 
         // Text decoration
         $td = strtolower($seg['textDecoration'] ?? 'NONE');
+        $td = str_replace('strikethrough', 'line-through', $td);
         if($td !== 'none') $styles['text-decoration'] = $td;
+
+        // Text decoration style (SOLID, DOTTED, DASHED, WAVY, DOUBLE)
+        $tds = $seg['textDecorationStyle'] ?? null;
+        if($tds && $td !== 'none' && !empty($tds['value'])) {
+            $styles['text-decoration-style'] = strtolower($tds['value']);
+        }
 
         // Text transform
         $tc = strtoupper($seg['textCase'] ?? 'ORIGINAL');
         if($tc === 'UPPER')    $styles['text-transform'] = 'uppercase';
         if($tc === 'LOWER')    $styles['text-transform'] = 'lowercase';
         if($tc === 'TITLE')    $styles['text-transform'] = 'capitalize';
+
+        // List options (ordered / unordered / none)
+        $lo = $seg['listOptions'] ?? null;
+        if($lo && !empty($lo['type']) && strtoupper($lo['type']) !== 'NONE') {
+            $styles['list-style-type'] = strtolower($lo['type']) === 'ordered' ? 'decimal' : 'disc';
+            $styles['list-style-position'] = 'outside';
+        }
+
+        // Text indentation
+        $indent = (float)($seg['indentation'] ?? 0);
+        if($indent > 0) $styles['text-indent'] = round($indent) . 'px';
+
+        // List item spacing (vertical gap between list items)
+        $ls = (float)($seg['listSpacing'] ?? 0);
+        if($ls > 0) $styles['--list-spacing'] = round($ls) . 'px';
+
+        // Font style fallback (more reliable than parsing fontWeight string for "italic")
+        if(!isset($styles['font-style']) && isset($seg['fontStyle'])) {
+            if(strtoupper($seg['fontStyle']) === 'ITALIC') {
+                $styles['font-style'] = 'italic';
+            }
+        }
+
+        // Leading trim (TextStyle-level, removes vertical padding above/below text)
+        $lt = $seg['leadingTrim'] ?? null;
+        if($lt && isset($lt['type']) && $lt['type'] !== 'NONE') {
+            $styles['leading-trim'] = strtolower(str_replace('_', '-', $lt['type'])) === 'cap-height'
+                ? 'cap-height' : 'normal';
+            $styles['text-edge'] = 'cap alphabetic';
+        }
+
+        // Hanging punctuation (TextStyle-level)
+        if(!empty($seg['hangingPunctuation'])) {
+            $styles['hanging-punctuation'] = 'allow-end';
+        }
+
+        // Hanging list (TextStyle-level)
+        if(!empty($seg['hangingList'])) {
+            $styles['hanging-list'] = 'allow-end';
+        }
+
+        // Paragraph spacing (when segment-level, not just node-level)
+        $ps = (float)($seg['paragraphSpacing'] ?? 0);
+        if($ps > 0 && !isset($styles['margin-bottom'])) {
+            $styles['margin-bottom'] = round($ps) . 'px';
+        }
+
+        // Paragraph indent (when segment-level)
+        $pi = (float)($seg['paragraphIndent'] ?? 0);
+        if($pi > 0) $styles['text-indent'] = round($pi) . 'px';
 
         return $styles;
     }
@@ -1306,8 +2318,22 @@ class FigmaParser {
         // Prefer SVG over raster
         $rel = $node['mcp_svg_url'] ?? $node['mcp_image_url'] ?? null;
         if(!$rel) return null;
+
+        $rel = ltrim(str_replace('\\', '/', $rel), '/');
+        $parts = explode('/', $rel);
+        foreach($parts as $part) {
+            if($part === '..') return null;
+        }
+        $rel = implode('/', $parts);
+
         $abs = $this->extractDir . $rel;
-        return is_file($abs) ? $abs : null;
+        $absReal = realpath($abs);
+        $baseReal = realpath($this->extractDir);
+        if($absReal === false || $baseReal === false
+            || strpos($absReal, $baseReal) !== 0) {
+            return null;
+        }
+        return is_file($absReal) ? $absReal : null;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1359,6 +2385,61 @@ class FigmaParser {
     // Misc
     // ─────────────────────────────────────────────────────────────────────────
 
+    /**
+     * Returns true when two parsed items share both column and row ranges
+     * in the CSS grid — i.e. they would overlap visually.
+     */
+    private function gridRangesOverlap(array $a, array $b): bool {
+        $ags = $a['gridStyles'] ?? [];
+        $bgs = $b['gridStyles'] ?? [];
+
+        $ac1 = (int)($ags['grid-column-start'] ?? 1);
+        $bc1 = (int)($bgs['grid-column-start'] ?? 1);
+        $ac2 = $this->gridEnd($ags, 'column');
+        $bc2 = $this->gridEnd($bgs, 'column');
+        if($ac2 < $bc1 || $bc2 < $ac1) return false;
+
+        // Items without explicit row-start cannot overlap (flex-wrap layout)
+        if(!isset($ags['grid-row-start']) || !isset($bgs['grid-row-start'])) return false;
+
+        $ar1 = (int)$ags['grid-row-start'];
+        $br1 = (int)$bgs['grid-row-start'];
+        $ar2 = $this->gridEnd($ags, 'row');
+        $br2 = $this->gridEnd($bgs, 'row');
+        return !($ar2 < $br1 || $br2 < $ar1);
+    }
+
+    /**
+     * Returns the inclusive end coordinate of a grid range.
+     * Handles 'span N', '-1' (full span), and plain integer values.
+     */
+    private function gridEnd(array $styles, string $dim = 'column'): int {
+        $prefix = $dim === 'column' ? 'grid-column' : 'grid-row';
+        $start  = (int)($styles[$prefix . '-start'] ?? 1);
+        $end    = $styles[$prefix . '-end'] ?? '';
+        if($end === '-1') return 999;
+        if(preg_match('/^span (\d+)$/', $end, $m)) {
+            return $start + (int)$m[1] - 1;
+        }
+        if($end !== '') return (int)$end;
+        return $start;
+    }
+
+    /**
+     * Strip z-index from all children of a group that itself has z-index.
+     * The group's z-index cascades to descendants via CSS, so individual
+     * child z-indexes are redundant.
+     */
+    private function stripChildZIndex(array &$children): void {
+        foreach($children as &$child) {
+            unset($child['blockStyles']['z-index']);
+            if(($child['templateHint'] ?? '') === 'pg_group' && !empty($child['children'])) {
+                $this->stripChildZIndex($child['children']);
+            }
+        }
+        unset($child);
+    }
+
     private function fullWidthStyles(): array {
         return [
             'grid-column-start' => '1',
@@ -1379,7 +2460,7 @@ class FigmaParser {
             }
             $isGroup  = ($item['templateHint'] ?? '') === 'pg_group';
             $hasKids  = !empty($item['children']);
-            $hasStyle = !empty($item['groupStyles']);
+            $hasStyle = !empty($item['groupStyles']) || !empty($item['blockStyles']);
             if($isGroup && !$hasKids && !$hasStyle) continue;
             $out[] = $item;
         }
