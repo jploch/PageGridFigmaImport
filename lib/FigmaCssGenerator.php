@@ -10,12 +10,14 @@ class FigmaCssGenerator {
     private $blocks = [];
 
     /**
-     * @param string $blockName   The ProcessWire page name of the block (e.g. "pg-group-1042").
-     * @param array  $styles      CSS property => value pairs for the block wrapper.
-     * @param array  $innerStyles Keyed by tag name (e.g. 'h2', 'p') → CSS property => value pairs.
+     * @param string $blockName        The ProcessWire page name of the block (e.g. "pg-group-1042").
+     * @param array  $styles           CSS property => value pairs for the block wrapper.
+     * @param array  $innerStyles      Keyed by tag name (e.g. 'h2', 'p') → CSS property => value pairs.
+     * @param array  $mobileStyles     Wrapper CSS props for @media (max-width: 640px).
+     * @param array  $mobileInnerStyles Keyed by tag name for @media (max-width: 640px).
      */
-    public function addBlock(string $blockName, array $styles, array $innerStyles = []): void {
-        $this->blocks[] = compact('blockName', 'styles', 'innerStyles');
+    public function addBlock(string $blockName, array $styles, array $innerStyles = [], array $mobileStyles = [], array $mobileInnerStyles = []): void {
+        $this->blocks[] = compact('blockName', 'styles', 'innerStyles', 'mobileStyles', 'mobileInnerStyles');
     }
 
     /** Renders all collected rules as a formatted CSS string. */
@@ -33,6 +35,19 @@ class FigmaCssGenerator {
                 if(!empty($props)) {
                     $parts[] = $this->renderRule('.' . $name . ' ' . $tag, $props);
                 }
+            }
+
+            $mobileCss = [];
+            if(!empty($block['mobileStyles'])) {
+                $mobileCss[] = $this->renderRule('.' . $name, $block['mobileStyles']);
+            }
+            foreach($block['mobileInnerStyles'] as $tag => $props) {
+                if(!empty($props)) {
+                    $mobileCss[] = $this->renderRule('.' . $name . ' ' . $tag, $props);
+                }
+            }
+            if(!empty($mobileCss)) {
+                $parts[] = "@media (max-width: 640px) {\n" . implode("\n", $mobileCss) . "\n}";
             }
         }
 

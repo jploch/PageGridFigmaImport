@@ -29,7 +29,7 @@ class PageGridFigmaImport extends WireData implements Module {
     public static function getModuleInfo(): array {
         return [
             'title'    => 'PageGrid Figma Import',
-            'version'  => '0.1.2',
+            'version'  => '0.1.6',
             'author'   => 'Jan Ploch, Claude AI',
             'summary'  => 'Import Figma ZIP exports and build PageGrid pages from the admin.',
             'icon'     => 'exchange',
@@ -176,6 +176,11 @@ class PageGridFigmaImport extends WireData implements Module {
         }
         $pagegrid->setStyles($fc, $fcStyles);
 
+        // Mobile breakpoint: cap padding to 20px if larger
+        if($parsed['framePadding'] > 20) {
+            $pagegrid->setStyles($fc, ['padding' => '20px'], 's');
+        }
+
         // ── 6b. Detect flush children and apply negative margins ────────────
         $framePadding = (int)$parsed['framePadding'];
         $frameWidth   = (float)($data['absoluteBoundingBox']['width'] ?? 1280);
@@ -206,6 +211,18 @@ class PageGridFigmaImport extends WireData implements Module {
                 }
                 if($frameHeight > 0 && abs(($y + $h) - $frameHeight) < $snapTolerance) {
                     $parsed['groups'][$i]['blockStyles']['margin-bottom'] = '-' . $framePadding . 'px';
+                }
+
+                // When horizontal negative margins pull the item past the frame
+                // edges, compensate width so the content area stays intact.
+                // Full-bleed uses width:100vw + margin-left:calc(50%-50vw) instead.
+                if(!$isFullBleed) {
+                    $hComp = 0;
+                    if(!empty($parsed['groups'][$i]['blockStyles']['margin-left']))  $hComp += $framePadding;
+                    if(!empty($parsed['groups'][$i]['blockStyles']['margin-right'])) $hComp += $framePadding;
+                    if($hComp > 0) {
+                        $parsed['groups'][$i]['blockStyles']['width'] = 'calc(100% + ' . $hComp . 'px)';
+                    }
                 }
             }
         }
@@ -265,6 +282,7 @@ class PageGridFigmaImport extends WireData implements Module {
             // Layout styles: display:grid/block, grid-template-columns, gap — always metadata
             if(!empty($groupData['groupLayoutStyles'])) {
                 $pagegrid->setStyles($group, $groupData['groupLayoutStyles']);
+                $this->capPaddingOnMobile($pagegrid, $group, $groupData['groupLayoutStyles'], $groupData['blockStyles'] ?? []);
             }
 
             // Margin-bottom to recreate the Figma gap between groups.
@@ -290,6 +308,9 @@ class PageGridFigmaImport extends WireData implements Module {
                 $this->createBlock($childData, $group, $pagegrid, $mode, $cssGen, $extractDir);
             }
         }
+
+        // Clean up extracted files — no longer needed after import
+        wireRmdir($extractDir, true);
 
         $adminUrl = $this->config->urls->admin . 'page/edit/?id=' . $newPage->id;
 
@@ -334,6 +355,23 @@ class PageGridFigmaImport extends WireData implements Module {
             return;
         }
 
+        // Flex child: override core .pg-group { width: 100%; margin: 0 auto; }
+        // so pg_group children of display:flex parents shrink to content width.
+        if ($templateName === 'pg_group') {
+            $parentPgStyles = $parent->meta('pg_styles');
+            $parentDisplay = $parentPgStyles['pgitem']['breakpoints']['base']['css']['display'] ?? '';
+            if ($parentDisplay === 'flex') {
+                $hasOwnMargin = !empty($childData['blockStyles']['margin'])
+                    || !empty($childData['groupStyles']['margin']);
+                if (!$hasOwnMargin) {
+                    $pagegrid->setStyles($block, [
+                        'width'  => 'auto',
+                        'margin' => '0',
+                    ]);
+                }
+            }
+        }
+
         // Grid position (always metadata)
         $pagegrid->setStyles($block, $childData['gridStyles']);
 
@@ -342,6 +380,7 @@ class PageGridFigmaImport extends WireData implements Module {
         if(!empty($childData['children'])) {
             if(!empty($childData['groupLayoutStyles'])) {
                 $pagegrid->setStyles($block, $childData['groupLayoutStyles']);
+                $this->capPaddingOnMobile($pagegrid, $block, $childData['groupLayoutStyles'], $childData['blockStyles'] ?? []);
             }
             if(!empty($childData['groupStyles'])) {
                 if($mode === 'A') {
@@ -402,13 +441,19 @@ class PageGridFigmaImport extends WireData implements Module {
                     // but strip margin-* (meaningless on a block wrapper)
                     $filtered = array_filter($styles, fn($k) => strpos($k, 'margin') !== 0, ARRAY_FILTER_USE_KEY);
                     if(!empty($filtered)) $pagegrid->setStyles($block, $filtered);
+                    $capped = $this->capFontSizeOnMobile($filtered);
+                    if($capped) $pagegrid->setStyles($block, ['font-size' => $capped], 's');
                 } else {
                     $pagegrid->setStyles($block, $styles, 'base', $tag, ['tagName' => $tag, 'cssClass' => '']);
+                    $capped = $this->capFontSizeOnMobile($styles);
+                    if($capped) $pagegrid->setStyles($block, ['font-size' => $capped], 's', $tag, ['tagName' => $tag, 'cssClass' => '']);
                 }
             }
         } else {
             // Mode B: visual styles → CSS output
             $innerForCss = [];
+            $mobileStyles = [];
+            $mobileInnerStyles = [];
             foreach($childData['innerStyles'] as $tag => $styles) {
                 if(empty($styles)) continue;
                 if($isRootStyleBlock) {
@@ -416,11 +461,15 @@ class PageGridFigmaImport extends WireData implements Module {
                     // but strip margin-* (meaningless on a block wrapper)
                     $filtered = array_filter($styles, fn($k) => strpos($k, 'margin') !== 0, ARRAY_FILTER_USE_KEY);
                     $blockVisual = array_merge($blockVisual, $filtered);
+                    $capped = $this->capFontSizeOnMobile($filtered);
+                    if($capped) $mobileStyles['font-size'] = $capped;
                 } else {
                     $innerForCss[$tag] = $styles;
+                    $capped = $this->capFontSizeOnMobile($styles);
+                    if($capped) $mobileInnerStyles[$tag]['font-size'] = $capped;
                 }
             }
-            $cssGen->addBlock($block->name, $blockVisual, $innerForCss);
+            $cssGen->addBlock($block->name, $blockVisual, $innerForCss, $mobileStyles, $mobileInnerStyles);
         }
 
         // Content
@@ -463,6 +512,10 @@ class PageGridFigmaImport extends WireData implements Module {
                     $svg = preg_replace("/\bon\w+\s*=\s*'[^']*'/i", '', $svg);
                     $svg = preg_replace('/javascript\s*:/i', '', $svg);
                     file_put_contents($imagePath, $svg);
+                }
+
+                if($ext !== 'svg') {
+                    $this->cropImageBorders($imagePath);
                 }
 
                 $block->of(false);
@@ -701,6 +754,78 @@ class PageGridFigmaImport extends WireData implements Module {
 
         $pagegrid->setStyles($page, $cssProps, 'base', 'pgitem', ['cssClass' => $className]);
         return 'created';
+    }
+
+    private function capFontSizeOnMobile(array $styles): ?string {
+        $fs = $styles['font-size'] ?? '';
+        if(preg_match('/^(\d+)px$/', $fs, $m) && (int)$m[1] > 100) {
+            return '100px';
+        }
+        return null;
+    }
+
+    private function capPaddingOnMobile($pagegrid, Page $block, array $layoutStyles, array $blockStyles = []): void {
+        $mobileS = [];
+        foreach(['padding', 'padding-left', 'padding-right', 'padding-top', 'padding-bottom'] as $pp) {
+            if(isset($layoutStyles[$pp]) && preg_match('/^(\d+)px$/', $layoutStyles[$pp], $m) && (int)$m[1] > 20)
+                $mobileS[$pp] = '20px';
+        }
+        $hasNegLeft = false;
+        $hasNegRight = false;
+        foreach(['margin-left', 'margin-right', 'margin-top', 'margin-bottom'] as $mp) {
+            if(isset($blockStyles[$mp]) && preg_match('/^-\d+/', $blockStyles[$mp])) {
+                $mobileS[$mp] = '-20px';
+                if($mp === 'margin-left') $hasNegLeft = true;
+                if($mp === 'margin-right') $hasNegRight = true;
+            }
+        }
+        if(!empty($mobileS) && isset($blockStyles['width']) && preg_match('/^calc\(100%\s*\+\s*\d+px\)$/', $blockStyles['width'])) {
+            $mobileS['width'] = ($hasNegLeft && $hasNegRight) ? 'calc(100% + 40px)' : 'calc(100% + 20px)';
+        }
+        if(!empty($mobileS)) $pagegrid->setStyles($block, $mobileS, 's');
+    }
+
+    /**
+     * Figma's node.exportAsync() renders images with a 1px anti-aliased border
+     * around all four edges. This crops 1px off each side so the image is a clean
+     * rectangle. If Figma ever fixes this rendering artifact, this function can be
+     * removed and the call site above can be deleted.
+     *
+     * Skipped for images ≤ 100px wide (icons, small decorators).
+     */
+    private function cropImageBorders(string $path): void {
+        $info = @getimagesize($path);
+        if(!$info) return;
+        $w = (int)$info[0];
+        $h = (int)$info[1];
+        $type = $info[2];
+        if($w <= 100 || $h <= 2) return;
+
+        $src = match($type) {
+            IMAGETYPE_PNG  => @imagecreatefrompng($path),
+            IMAGETYPE_JPEG => @imagecreatefromjpeg($path),
+            default => null,
+        };
+        if(!$src) return;
+
+        $nw = $w - 2;
+        $nh = $h - 2;
+        $dst = imagecreatetruecolor($nw, $nh);
+        if($type === IMAGETYPE_PNG) {
+            imagealphablending($dst, false);
+            imagesavealpha($dst, true);
+            $transparent = imagecolorallocatealpha($dst, 0, 0, 0, 127);
+            imagefill($dst, 0, 0, $transparent);
+        }
+        imagecopy($dst, $src, 0, 0, 1, 1, $nw, $nh);
+
+        if($type === IMAGETYPE_PNG) {
+            imagepng($dst, $path, 9);
+        } else {
+            imagejpeg($dst, $path, 100);
+        }
+        imagedestroy($src);
+        imagedestroy($dst);
     }
 
     private function fail(string $message): array {
