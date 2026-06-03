@@ -246,7 +246,8 @@ class PageGridFigmaImport extends WireData implements Module {
                         $textStylesUpdated[] = $style['className'];
                     }
                 } else {
-                    $cssGen->addBlock($style['className'], $style['cssProps']);
+                    $capped = $this->capFontSizeOnMobile($style['cssProps']);
+                    $cssGen->addBlock($style['className'], $style['cssProps'], [], $capped ? ['font-size' => $capped] : []);
                     $textStylesInCss++;
                 }
             }
@@ -741,8 +742,14 @@ class PageGridFigmaImport extends WireData implements Module {
         if($existing->id) {
             // Only write if CSS values actually changed
             $stored = $existing->meta('pg_styles')['pgitem']['breakpoints']['base']['css'] ?? [];
-            if($cssProps === $stored) return 'unchanged';
+            if($cssProps === $stored) {
+                $capped = $this->capFontSizeOnMobile($cssProps);
+                if($capped) $pagegrid->setStyles($existing, ['font-size' => $capped], 's', 'pgitem', ['cssClass' => $className]);
+                return 'unchanged';
+            }
             $pagegrid->setStyles($existing, $cssProps, 'base', 'pgitem', ['cssClass' => $className]);
+            $capped = $this->capFontSizeOnMobile($cssProps);
+            if($capped) $pagegrid->setStyles($existing, ['font-size' => $capped], 's', 'pgitem', ['cssClass' => $className]);
             return 'updated';
         }
 
@@ -753,6 +760,8 @@ class PageGridFigmaImport extends WireData implements Module {
         $page->save();
 
         $pagegrid->setStyles($page, $cssProps, 'base', 'pgitem', ['cssClass' => $className]);
+        $capped = $this->capFontSizeOnMobile($cssProps);
+        if($capped) $pagegrid->setStyles($page, ['font-size' => $capped], 's', 'pgitem', ['cssClass' => $className]);
         return 'created';
     }
 

@@ -1736,17 +1736,16 @@ class FigmaParser {
             // Adjacent same-tag, same-listType content tokens with no intervening
             // newlines belong to the same paragraph or list item.
             $spans    = [];
-            $spans[]  = ['text' => $tok['text'], 'styles' => $this->segmentToStyles($seg)];
+            $spans[]  = ['text' => $tok['text'], 'styles' => $this->segmentToStyles($seg), 'seg' => $seg];
             $spans[0]['styles']['margin-top'] = '0';
 
             while(isset($tokens[$i + 1]) && $tokens[$i + 1]['type'] === 'content'
                     && $tokens[$i + 1]['tag'] === $tag
-                    && ($tokens[$i + 1]['listType'] ?? null) === $listType
-                    && $this->hyperlinkMatch($tok, $tokens[$i + 1])) {
+                    && ($tokens[$i + 1]['listType'] ?? null) === $listType) {
                 $i++;
                 $sStyles = $this->segmentToStyles($tokens[$i]['seg']);
                 $sStyles['margin-top'] = '0';
-                $spans[] = ['text' => $tokens[$i]['text'], 'styles' => $sStyles];
+                $spans[] = ['text' => $tokens[$i]['text'], 'styles' => $sStyles, 'seg' => $tokens[$i]['seg']];
             }
 
             // Merge same-tag content tokens across single newlines.
@@ -1759,12 +1758,11 @@ class FigmaParser {
                 && $tokens[$i + 1]['count'] === 1
                 && isset($tokens[$i + 2]) && $tokens[$i + 2]['type'] === 'content'
                 && $tokens[$i + 2]['tag'] === $tag
-                && ($tokens[$i + 2]['listType'] ?? null) === $listType
-                && $this->hyperlinkMatch($tok, $tokens[$i + 2])) {
+                && ($tokens[$i + 2]['listType'] ?? null) === $listType) {
                 $i += 2;
                 $sStyles = $this->segmentToStyles($tokens[$i]['seg']);
                 $sStyles['margin-top'] = '0';
-                $spans[] = ['text' => '<br>' . $tokens[$i]['text'], 'styles' => $sStyles];
+                $spans[] = ['text' => '<br>' . $tokens[$i]['text'], 'styles' => $sStyles, 'seg' => $tokens[$i]['seg']];
             }
 
             // Compute base styles by merging all spans (last wins), but exclude
@@ -1818,9 +1816,6 @@ class FigmaParser {
                 }
             }
 
-            $hl    = $tok['seg']['hyperlink'] ?? null;
-            $hasHl = $hl && isset($hl['type']) && $hl['type'] === 'URL' && !empty($hl['value']);
-
             if($listType) {
                 $html .= '<li>';
             } else {
@@ -1828,24 +1823,30 @@ class FigmaParser {
                 $html     .= '<' . $tag . $classAttr . '>';
             }
 
-            if($hasHl) {
-                $href  = htmlspecialchars($hl['value'], ENT_QUOTES);
-                $html .= '<a href="' . $href . '" rel="noopener">';
-            }
-
             // Render each span. When a span's styles differ from base, wrap it in
             // <strong>, <em>, <u>, <s>, or <span> using single-level innerStyles
             // keys. At most one unique <span> diff is allowed per block to
             // avoid property merging across different parent contexts.
-            // Hyperlinked spans: emit bare (already inside <a>), diff against the
-            // stored parent base and accumulate into the 'a' selector.
+            // Emit spans with per-span hyperlink wrapping.
+            // Adjacent same-URL spans share a single <a> tag to avoid underline gaps.
+            $openHref = null;
+            $hasAnyHl = false;
             foreach($spans as $sp) {
+                $hl    = $sp['seg']['hyperlink'] ?? null;
+                $hasHl = $hl && isset($hl['type']) && $hl['type'] === 'URL' && !empty($hl['value']);
+                if($hasHl) $hasAnyHl = true;
+                $spHref = $hasHl ? $hl['value'] : null;
+
+                if($openHref !== null && $spHref !== $openHref) {
+                    $html .= '</a>';
+                    $openHref = null;
+                }
+                if($spHref !== null && $openHref === null) {
+                    $html .= '<a href="' . htmlspecialchars($spHref, ENT_QUOTES) . '" rel="noopener">';
+                    $openHref = $spHref;
+                }
+
                 $diff = $this->computeSpanDiff($sp['styles'], $baseStyles);
-                // When a block has exactly one span and its only style differences
-                // are font-weight / font-style / text-decoration, promote those
-                // props to the parent tag and skip the redundant <span> wrapper.
-                // Skip hyperlinked spans — link styles must stay on the <a> tag
-                // and never bleed into the parent tag (p, h*, etc.).
                 if($diff !== null && count($spans) === 1 && !$hasHl) {
                     $nonSub = array_diff_key($diff, array_flip($subOnly));
                     if(empty($nonSub)) {
@@ -1896,7 +1897,7 @@ class FigmaParser {
                 }
             }
 
-            if($hasHl) {
+            if($openHref !== null) {
                 $html .= '</a>';
             }
 
@@ -1911,7 +1912,7 @@ class FigmaParser {
                 $wrapperStyles = $this->listWrapperStyles($seg);
                 $tagStyles[$listType] = array_merge($tagStyles[$listType] ?? [], $wrapperStyles);
                 $tagStyles['li']      = array_merge($tagStyles['li']      ?? [], $baseStyles);
-            } elseif(!$hasHl) {
+            } elseif(!$hasAnyHl) {
                 $tagStyles[$tag] = array_merge($tagStyles[$tag] ?? [], $baseStyles);
             }
         }
