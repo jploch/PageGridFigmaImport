@@ -14,4 +14,4 @@ Export your Figma design as a ZIP file using the [Figma to PageGrid Exporter Plu
 
 ## Documentation
 
-Full documentation and usage guide: **<https://page-grid.com/docs/figmaimport/>**
+[Full documentation and usage guide](https://page-grid.com/docs/figmaimport/)
