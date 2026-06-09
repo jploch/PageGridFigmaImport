@@ -13,5 +13,32 @@ Export your Figma design as a ZIP file using the [Figma to PageGrid Exporter Plu
 - Creates a new ProcessWire page with all blocks pre-populated, ready to edit in the visual editor
 
 ## Documentation
-
 [Full documentation and usage guide](https://page-grid.com/docs/figmaimport/)
+
+## Requirements
+- Process Wire 3.0.210 or greater
+- [PAGEGRID Fieldtype Module](https://github.com/jploch/FieldtypePageGrid/)
+
+## Installation
+1. Go to ```Modules > Site > Add New``` in your admin
+2. Paste the Module Class Name ```PageGridBlocks``` into the field “Add Module From Directory“
+3. Click “Get Module Info“
+4. On the overview, click “Download And Install“
+5. On the following screen, click “Install Now“
+
+### Contribute
+
+**Found a bug?**  
+Please post all bug reports in our [issue tracker](https://github.com/jploch/FieldtypePageGrid/issues/).
+
+**Suggest a feature**  
+If you have ideas for a feature or enhancement for PAGEGRID, please make a post on the [PAGEGRID forum](https://processwire.com/talk/forum/64-pagegrid/).
+
+## What's PAGEGRID?
+- **[page-grid.com](https://page-grid.com)** – Get to know PAGEGRID.
+- **[Documentation](https://page-grid.com/docs/)** – Read the official documentation.
+- **[Issues](https://github.com/jploch/FieldtypePageGrid/issues/)** – Report bugs and other problems.
+- **[Forum](https://processwire.com/talk/forum/64-pagegrid/)** – Whenever you get stuck, don't hesitate to reach out for questions and support.
+
+© 2026 Jan Ploch
+[page-grid.com](https://page-grid.com) · [License agreement for PAGEGRID Module](https://github.com/jploch/FieldtypePageGrid/blob/main/LICENSE.md)
