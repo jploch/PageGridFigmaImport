@@ -10,10 +10,10 @@ class ProcessPageGridFigmaImport extends Process {
 
     public static function getModuleInfo(): array {
         return [
-            'title'       => 'Figma Import',
+            'title'       => 'Admin interface for PageGridFigmaImport',
             'version'     => '0.1.1',
             'author'      => 'Jan Ploch, Claude AI',
-            'summary'     => 'Import Figma ZIP exports into PageGrid pages.',
+            'summary'     => 'Auto-installed by PageGridFigmaImport.',
             'icon'        => 'exchange',
             'requires'    => ['PageGridFigmaImport'],
             'permission'  => 'pagegrid-figma-import',
