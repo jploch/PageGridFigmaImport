@@ -11,7 +11,7 @@ class ProcessPageGridFigmaImport extends Process {
     public static function getModuleInfo(): array {
         return [
             'title'       => 'Admin interface for PageGridFigmaImport',
-            'version'     => '0.1.1',
+            'version'     => '0.1.2',
             'author'      => 'Jan Ploch, Claude AI',
             'summary'     => 'Auto-installed by PageGridFigmaImport.',
             'icon'        => 'exchange',
@@ -82,8 +82,24 @@ class ProcessPageGridFigmaImport extends Process {
         $f->label       = 'Figma ZIP Export';
         $f->description = 'Upload the ZIP file exported from Figma using the "Figma to PageGrid Exporter" Plugin.';
         $f->value = '
-            <label id="figma-zip-label" style="display:inline-flex;align-items:center;gap:10px;cursor:pointer;padding:8px 16px;background:#f4f4f4;border:1px solid #ccc;border-radius:3px;font-size:14px;" 
-                   onmouseover="this.style.background=\'#e8e8e8\'" onmouseout="this.style.background=\'#f4f4f4\'">
+            <style>
+            #figma-zip-label {
+                display: inline-flex;
+                align-items: center;
+                gap: 10px;
+                cursor: pointer;
+                padding: 8px 16px;
+                border: 1px solid var(--pw-border-color, #ccc);
+                border-radius: 3px;
+                font-size: 14px;
+                background: var(--pw-inputs-background, #f4f4f4);
+                color: var(--pw-text-color, inherit);
+            }
+            #figma-zip-label:hover {
+                background: var(--pw-blocks-background, #e8e8e8);
+            }
+            </style>
+            <label id="figma-zip-label">
                 <i class="fa fa-upload"></i>
                 <span id="figma-zip-label-text">Choose ZIP file…</span>
                 <input type="file" name="figma_zip" accept=".zip" required
