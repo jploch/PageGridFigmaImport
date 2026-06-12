@@ -11,7 +11,7 @@ class ProcessPageGridFigmaImport extends Process {
     public static function getModuleInfo(): array {
         return [
             'title'       => 'Admin interface for PageGridFigmaImport',
-            'version'     => '0.1.2',
+            'version'     => '0.1.3',
             'author'      => 'Jan Ploch, Claude AI',
             'summary'     => 'Auto-installed by PageGridFigmaImport.',
             'icon'        => 'exchange',
@@ -80,7 +80,7 @@ class ProcessPageGridFigmaImport extends Process {
         $f = $this->modules->get('InputfieldMarkup');
         $f->attr('name', 'figma_zip_wrapper');
         $f->label       = 'Figma ZIP Export';
-        $f->description = 'Upload the ZIP file exported from Figma using the "Figma to PageGrid Exporter" Plugin.';
+        $f->description = 'Upload the ZIP file exported from Figma using the [Figma to PageGrid Exporter](https://www.figma.com/community/plugin/1630663953586135342/figma-to-pagegrid-exporter) Plugin.';
         $f->value = '
             <style>
             #figma-zip-label {
